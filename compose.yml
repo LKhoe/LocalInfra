@@ -1,0 +1,136 @@
+# LocalInfra — shared data services for every project on the Pi.
+#
+#   postgres  → network "localinfra_postgres"  (one role + one database per project)
+#   redis     → network "localinfra_redis"     (one ACL user per project, keys "<project>:*")
+#   backup    → nightly pg_dump of every database to the external drive
+#
+# Projects join only the network(s) they need, as external networks.
+# New project:   scripts/new-project.sh <name>
+#
+# No "./file" bind mounts on purpose: this stack can be deployed from the Mac with
+# a Docker context (DOCKER_CONTEXT=pi docker compose up -d --build) and relative
+# bind mounts would point at paths that only exist on the Mac.
+
+name: localinfra
+
+services:
+  postgres:
+    container_name: localinfra-postgres
+    image: postgres:${PG_VERSION:-17}-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set POSTGRES_SUPERUSER_PASSWORD in .env}
+      POSTGRES_DB: postgres
+      TZ: ${TZ:-UTC}
+    # Tuned for a Raspberry Pi 4 (8 GB) that also runs umbrelOS and its apps.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-100}
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - log_min_duration_statement=1000
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Loopback only by default: reach it from the Pi itself or via an SSH tunnel.
+      - "${POSTGRES_PUBLISH:-127.0.0.1:5432}:5432"
+    networks:
+      - postgres
+    shm_size: 128mb
+    stop_grace_period: 1m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${PG_MEMORY_LIMIT:-1G}
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    container_name: localinfra-redis
+    build:
+      context: ./redis
+      args:
+        REDIS_VERSION: ${REDIS_VERSION:-7.4}
+    image: localinfra-redis:${REDIS_VERSION:-7.4}
+    restart: unless-stopped
+    environment:
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?set REDIS_ADMIN_PASSWORD in .env}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-256mb}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PUBLISH:-127.0.0.1:6379}:6379"
+    networks:
+      - redis
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_ADMIN_PASSWORD}\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-384M}
+    logging: *logging
+
+  backup:
+    container_name: localinfra-backup
+    build:
+      context: ./backup
+      args:
+        PG_VERSION: ${PG_VERSION:-17}
+    image: localinfra-backup:${PG_VERSION:-17}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_SUPERUSER:-postgres}
+      PGPASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      TZ: ${TZ:-UTC}
+      BACKUP_CRON: ${BACKUP_CRON:-0 4 * * *}
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-6}
+      BACKUP_ON_START: ${BACKUP_ON_START:-false}
+    volumes:
+      # Absolute path ON THE PI (on the external drive). Must contain the marker
+      # file ".localinfra-backup-target" — see README.
+      - ${BACKUP_DIR:?set BACKUP_DIR in .env}:/backups
+    networks:
+      - postgres
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging: *logging
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  postgres:
+    name: localinfra_postgres
+  redis:
+    name: localinfra_redis
