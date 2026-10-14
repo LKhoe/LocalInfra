@@ -1,0 +1,36 @@
+version: "3.7"
+
+services:
+  # Not a container on umbrelOS 2: configures the built-in gateway that serves
+  # the status page on the app's port, behind the Umbrel login.
+  app_proxy:
+    environment:
+      APP_HOST: localinfra-health_server_1
+      APP_PORT: 3000
+
+  server:
+    # Stock image (same base as yarg's); the app is the single file next to this one
+    image: node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+    restart: on-failure
+    command: ["node", "/app/server.mjs"]
+    environment:
+      PORT: 3000
+    volumes:
+      - ${APP_DATA_DIR}/server.mjs:/app/server.mjs:ro
+      # Read-only use: server.mjs only ever calls GET /containers/json
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Unprivileged: the node user plus the host's docker group (gid 987 on
+    # umbrelOS) to read the socket. No root, no capabilities, read-only FS.
+    user: "1000:1000"
+    group_add:
+      - "987"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

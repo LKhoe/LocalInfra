@@ -19,6 +19,8 @@ LocalInfra/
   backup/              tiny image: pg_dump + busybox crond (backup.sh)
   scripts/new-project.sh    provision a project (db role + redis user), print its env
   scripts/bootstrap-pi.sh   first deploy from the Mac: LocalInfra + yarg, with checks
+  umbrel-app-store.yml      makes this repo an umbrelOS community app store
+  localinfra-health/        "Container Health" umbrelOS app: home-screen widgets
 ```
 
 There are no `./file` bind mounts on purpose. The stack can be deployed from the Mac
@@ -181,6 +183,31 @@ docker volume ls | grep yarg     # then: docker volume rm <the old postgres/redi
 ```
 
 Old Redis data (queue history, progress) is temporary and isn't migrated.
+
+## 7. Container Health widget (umbrelOS)
+
+This repo is also an umbrelOS community app store with one app, **Container Health**:
+home-screen widgets (one row per Compose project, problems first, plus healthy /
+starting / unhealthy / stopped counts) and a status page behind the Umbrel login.
+
+- It lists the containers **you** run: anything umbrelOS didn't start (umbrelOS apps
+  carry the compose working dir `/opt/umbreld/...`). New projects show up on their own.
+- Hide a one-off container with the label `localinfra.health.hide=true`.
+- `localinfra-backup` turns unhealthy when no backup succeeded in 26h, so a missed
+  backup shows up there too.
+- One container (stock `node:24-alpine` + `localinfra-health/server.mjs`), no root,
+  read-only. It only calls `GET /containers/json` on the Docker socket; it reads it
+  through the host's `docker` group (gid 987 on umbrelOS).
+
+Install once, in the Umbrel UI:
+
+1. App Store → `⋯` (top right) → **Community App Stores** → add `https://github.com/LKhoe/LocalInfra`
+2. Open the **LocalInfra** store → **Container Health** → Install
+3. Home screen → right-click (or long-press) → **Edit widgets** → add *Container Health*
+   (umbrelOS allows 3 widgets in total)
+
+To update it: change `localinfra-health/`, bump `version` in its `umbrel-app.yml`,
+push, then update the app in the Umbrel App Store.
 
 ## Notes
 

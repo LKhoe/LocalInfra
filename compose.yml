@@ -119,6 +119,14 @@ services:
       - ${BACKUP_DIR:?set BACKUP_DIR in .env}:/backups
     networks:
       - postgres
+    # Unhealthy when no backup succeeded in the last 26h (or ever), so a missed
+    # backup shows up in Container Health like any other broken container.
+    healthcheck:
+      test: ["CMD-SHELL", "find /backups/postgres/last_success -mmin -1560 2>/dev/null | grep -q ."]
+      interval: 5m
+      timeout: 10s
+      retries: 1
+      start_period: 1m
     deploy:
       resources:
         limits:

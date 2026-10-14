@@ -1,0 +1,5 @@
+# This repo doubles as an umbrelOS community app store (apps live in ./<id>/).
+# Add it on the Umbrel: App Store → ⋯ → Community App Stores → https://github.com/LKhoe/LocalInfra
+# Every app id must start with this store id.
+id: localinfra
+name: LocalInfra
