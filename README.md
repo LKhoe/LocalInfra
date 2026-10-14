@@ -19,6 +19,7 @@ LocalInfra/
   backup/              tiny image: pg_dump + busybox crond (backup.sh)
   scripts/new-project.sh    provision a project (db role + redis user), print its env
   scripts/bootstrap-pi.sh   first deploy from the Mac: LocalInfra + yarg, with checks
+  scripts/check-health-app.sh   checks the Container Health app before a release
   umbrel-app-store.yml      makes this repo an umbrelOS community app store
   localinfra-health/        "Container Health" umbrelOS app: home-screen widgets
 ```
@@ -199,7 +200,7 @@ a status page behind the Umbrel login and three home-screen widgets to pick from
 - Hide a one-off container with the label `localinfra.health.hide=true`.
 - `localinfra-backup` turns unhealthy when no backup succeeded in 26h, so a missed
   backup shows up there too.
-- One container (stock `node:24-alpine` + `localinfra-health/server.mjs`), no root,
+- One container (stock `node:24-alpine` + `localinfra-health/server.mjs.template`), no root,
   read-only. It only calls `GET /containers/json` on the Docker socket; it reads it
   through the host's `docker` group (gid 987 on umbrelOS).
 
@@ -210,8 +211,15 @@ Install once, in the Umbrel UI:
 3. Home screen → right-click (or long-press) → **Edit widgets** → add *Container Health*
    (umbrelOS allows 3 widgets in total)
 
-To update it: change `localinfra-health/`, bump `version` in its `umbrel-app.yml`,
-push, then update the app in the Umbrel App Store.
+To update it: change `localinfra-health/`, run `scripts/check-health-app.sh`, bump
+`version` in its `umbrel-app.yml`, push, then update the app in the Umbrel App Store
+(umbrelOS checks community stores every 5 minutes).
+
+umbrelOS updates only copy `docker-compose.yml`, `*.template`, `exports.sh`, `torrc`,
+`hooks` and `umbrel-app.yml`. That's why the server is `server.mjs.template`: it is
+rendered with `envsubst` on install and update, so it must not contain a `$` (the
+check script enforces this). Any other file added to the app folder would only be
+copied on a fresh install.
 
 ## Notes
 
