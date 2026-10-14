@@ -8,7 +8,7 @@
 # New project:   scripts/new-project.sh <name>
 #
 # No "./file" bind mounts on purpose: this stack can be deployed from the Mac with
-# a Docker context (DOCKER_CONTEXT=pi docker compose up -d --build) and relative
+# a Docker context (DOCKER_CONTEXT=umbrel docker compose up -d --build) and relative
 # bind mounts would point at paths that only exist on the Mac.
 
 name: localinfra

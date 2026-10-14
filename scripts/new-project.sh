@@ -14,7 +14,7 @@
 #   --no-redis     only create the Postgres role + database
 #
 # Runs against whatever your docker CLI points at: on the Pi itself, or from the
-# Mac with  DOCKER_CONTEXT=pi scripts/new-project.sh <name>
+# Mac with  DOCKER_CONTEXT=umbrel scripts/new-project.sh <name>
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

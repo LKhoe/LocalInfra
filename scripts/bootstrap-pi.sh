@@ -4,12 +4,12 @@
 #
 #   scripts/bootstrap-pi.sh
 #
-# Overridable: PI_SSH (default umbrel@umbrel.local), DOCKER_CONTEXT_NAME (default pi),
+# Overridable: PI_SSH (default umbrel@umbrel.local), DOCKER_CONTEXT_NAME (default umbrel),
 #              YARG_DIR (default ../music/yarg-aggregator next to this repo)
 set -euo pipefail
 
 PI_SSH="${PI_SSH:-umbrel@umbrel.local}"
-CTX="${DOCKER_CONTEXT_NAME:-pi}"
+CTX="${DOCKER_CONTEXT_NAME:-umbrel}"
 INFRA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 YARG_DIR="${YARG_DIR:-$INFRA_DIR/../music/yarg-aggregator}"
 
@@ -88,7 +88,11 @@ ok "localinfra-backup is running"
 # ------------------------------------------------------------------ provision yarg
 step "Provisioning yarg on LocalInfra"
 YARG_ENV="$YARG_DIR/.env"
-if [[ "$(env_get "$YARG_ENV" DATABASE_URL)" == *@localinfra-postgres:* && "$(env_get "$YARG_ENV" REDIS_USERNAME)" == yarg ]]; then
+yarg_db_url=$(env_get "$YARG_ENV" DATABASE_URL)
+yarg_redis_pw=$(env_get "$YARG_ENV" REDIS_PASSWORD)
+# Already provisioned = real credentials (not the <password> placeholders from .env.example)
+if [[ "$yarg_db_url" == *@localinfra-postgres:* && "$yarg_db_url" != *"<password>"* \
+   && "$(env_get "$YARG_ENV" REDIS_USERNAME)" == yarg && -n "$yarg_redis_pw" && "$yarg_redis_pw" != "<password>" ]]; then
   ok "yarg .env already points at LocalInfra - keeping its credentials"
 else
   prov=$(mktemp)
