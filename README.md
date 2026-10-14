@@ -187,8 +187,12 @@ Old Redis data (queue history, progress) is temporary and isn't migrated.
 ## 7. Container Health widget (umbrelOS)
 
 This repo is also an umbrelOS community app store with one app, **Container Health**:
-home-screen widgets (one row per Compose project, problems first, plus healthy /
-starting / unhealthy / stopped counts) and a status page behind the Umbrel login.
+a status page behind the Umbrel login and three home-screen widgets to pick from:
+
+- **Summary**: same style as the native Live Usage widget (containers healthy,
+  projects healthy, issues, with icons)
+- **Gauges**: two rings that fill with the healthy share of containers and projects
+- **Projects**: one row per Compose project, problems first
 
 - It lists the containers **you** run: anything umbrelOS didn't start (umbrelOS apps
   carry the compose working dir `/opt/umbreld/...`). New projects show up on their own.

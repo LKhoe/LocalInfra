@@ -134,24 +134,63 @@ async function projectsWidget() {
   }
 }
 
+// Same shape as the native "Live Usage" widget: three pill cells with an icon
+// (any Tabler icon name), a label and a value
 async function summaryWidget() {
-  let counts = null;
+  let stats = null;
   try {
-    ({ counts } = await snapshot());
+    stats = totals(await snapshot());
   } catch {
     // shown as dashes below
   }
-  const value = (key) => (counts ? String(counts[key]) : "–");
+  const issues = stats ? stats.issues : null;
   return {
-    type: "four-stats",
+    type: "three-stats",
     refresh: REFRESH,
     link: "",
     items: [
-      { title: "Healthy", text: value("ok") },
-      { title: "Starting", text: value("starting") },
-      { title: "Unhealthy", text: value("unhealthy") },
-      { title: "Stopped", text: value("stopped") },
+      { icon: "box", subtext: "Containers", text: stats ? `${stats.okContainers}/${stats.containers}` : "–" },
+      { icon: "stack-2", subtext: "Projects", text: stats ? `${stats.okProjects}/${stats.projects}` : "–" },
+      {
+        icon: issues === 0 ? "shield-check" : "alert-triangle",
+        subtext: "Issues",
+        text: issues === null ? "–" : String(issues),
+      },
     ],
+  };
+}
+
+// Two rings that fill up with the healthy share of containers and projects
+async function gaugesWidget() {
+  let stats = null;
+  try {
+    stats = totals(await snapshot());
+  } catch {
+    // empty rings below
+  }
+  const ring = (title, ok, total) => ({
+    title,
+    text: stats ? `${ok}/${total}` : "–",
+    progress: stats && total > 0 ? Number((ok / total).toFixed(2)) : 0,
+  });
+  return {
+    type: "two-stats-with-guage", // sic: umbrelOS spells it this way
+    refresh: REFRESH,
+    link: "",
+    items: [
+      ring("Containers", stats?.okContainers, stats?.containers),
+      ring("Projects", stats?.okProjects, stats?.projects),
+    ],
+  };
+}
+
+function totals({ projects, containers, counts }) {
+  return {
+    containers: containers.length,
+    okContainers: counts.ok,
+    projects: projects.length,
+    okProjects: projects.filter((p) => p.state === "ok").length,
+    issues: containers.length - counts.ok,
   };
 }
 
@@ -227,6 +266,7 @@ async function statusPage() {
 const routes = {
   "/widgets/projects": async () => ({ type: "application/json", body: JSON.stringify(await projectsWidget()) }),
   "/widgets/summary": async () => ({ type: "application/json", body: JSON.stringify(await summaryWidget()) }),
+  "/widgets/gauges": async () => ({ type: "application/json", body: JSON.stringify(await gaugesWidget()) }),
   "/healthz": async () => ({ type: "text/plain", body: "ok" }),
   "/": async () => ({ type: "text/html; charset=utf-8", body: await statusPage() }),
 };
