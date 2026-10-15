@@ -54,6 +54,18 @@ wait_healthy() {
   done
 }
 
+# Docker over a *shared* SSH connection (ControlMaster) hangs with no timeout when that connection
+# goes stale — it once froze a deploy mid-swap, old container stopped, new one not started.
+docker_host=$(docker context inspect "$DOCKER_CONTEXT" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+if [[ "$docker_host" == ssh://* ]]; then
+  ssh_host=${docker_host#ssh://}
+  if [[ "$(ssh -G "$ssh_host" 2>/dev/null | awk '$1 == "controlmaster" { print $2 }')" != false ]]; then
+    echo "Warning: Docker context '${DOCKER_CONTEXT}' (${docker_host}) shares SSH connections (ControlMaster)," >&2
+    echo "         which can hang a deploy halfway. Use the 'umbrel-docker' alias: LocalInfra README section 1." >&2
+    confirm "Deploy anyway?"
+  fi
+fi
+
 docker info --format '{{.Name}}' >/dev/null 2>&1 \
   || die "Docker context '${DOCKER_CONTEXT}' is not reachable (docker context inspect ${DOCKER_CONTEXT})."
 

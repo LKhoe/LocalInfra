@@ -51,8 +51,9 @@ Add the app here when you pick its port.
 
 ## Steps for a new app
 
-Prerequisites, once per Mac: the `umbrel` Docker context and SSH key login (README section 1),
-LocalInfra running on the Pi.
+Prerequisites, once per Mac: SSH key login and the `umbrel` Docker context on the
+`umbrel-docker` SSH alias, which never shares connections (README section 1), and LocalInfra
+running on the Pi.
 
 ### 1. Prepare the repo (once)
 
@@ -183,4 +184,5 @@ Never run `provision-app.sh` against Docker Desktop for an app whose `.env` hold
 | `password authentication failed` / S3 `403` / Redis `NOPERM` | `.env` doesn't match LocalInfra: rotate (above) |
 | `Error loading shared library libvips-cpp.so…` | rule 9: install runtime deps with `npm ci --omit=dev` |
 | Sign-in redirects to the wrong host | the public URL in `.env` is wrong; `NEXT_PUBLIC_*` needs a rebuild |
-| docker commands to the Pi hang | a stale SSH master connection (`ControlMaster`): `ssh -O exit umbrel@umbrel.local` |
+| docker commands to the Pi hang | the `umbrel` context is sharing an SSH connection: point it at the `umbrel-docker` alias (README section 1). Unstick it now with `ssh -O exit umbrel.local` |
+| A deploy stopped mid-way and the app is down | `DOCKER_CONTEXT=umbrel docker ps -a --filter name=<app>`: remove a leftover `<id>_<app>` container (`docker rm`), then `DOCKER_CONTEXT=umbrel docker compose up -d --no-build <app>` starts the new image. `./deploy.sh --rollback` goes back to the previous one instead |

@@ -4,12 +4,14 @@
 #
 #   scripts/bootstrap-pi.sh
 #
-# Overridable: PI_SSH (default umbrel@umbrel.local), DOCKER_CONTEXT_NAME (default umbrel),
+# Overridable: PI_SSH (default umbrel@umbrel.local), DOCKER_SSH_HOST (default umbrel-docker: the
+#              ~/.ssh/config alias docker uses, never sharing connections), DOCKER_CONTEXT_NAME (default umbrel),
 #              YARG_DIR (default ../music/yarg-aggregator next to this repo)
 set -euo pipefail
 
 PI_SSH="${PI_SSH:-umbrel@umbrel.local}"
 CTX="${DOCKER_CONTEXT_NAME:-umbrel}"
+DOCKER_SSH_HOST="${DOCKER_SSH_HOST:-umbrel-docker}"
 INFRA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 YARG_DIR="${YARG_DIR:-$INFRA_DIR/../music/yarg-aggregator}"
 
@@ -51,9 +53,21 @@ ssh -o BatchMode=yes "$PI_SSH" docker info >/dev/null 2>&1 \
   || die "'docker' on the Pi needs sudo for $PI_SSH. On the Pi run:  sudo usermod -aG docker \$USER  then log out/in."
 ok "docker works on the Pi without sudo"
 
+# Docker must not ride on a shared SSH connection: a stale one hangs docker commands with no
+# timeout (it once froze a deploy mid-swap). README section 1 has the alias to add.
+if [[ "$(ssh -G "$DOCKER_SSH_HOST" 2>/dev/null | awk '$1 == "hostname" { print $2 }')" == "$DOCKER_SSH_HOST" ]]; then
+  die "SSH alias '$DOCKER_SSH_HOST' is not in ~/.ssh/config. Add the 'Host umbrel-docker' block from README section 1."
+fi
+[[ "$(ssh -G "$DOCKER_SSH_HOST" | awk '$1 == "controlmaster" { print $2 }')" == false ]] \
+  || die "SSH alias '$DOCKER_SSH_HOST' shares connections: set 'ControlMaster no' and 'ControlPath none' for it."
+ok "SSH alias '$DOCKER_SSH_HOST' for docker (no shared connection)"
+
 if ! docker context inspect "$CTX" >/dev/null 2>&1; then
-  docker context create "$CTX" --docker "host=ssh://$PI_SSH" >/dev/null
-  ok "created docker context '$CTX' -> ssh://$PI_SSH"
+  docker context create "$CTX" --docker "host=ssh://$DOCKER_SSH_HOST" >/dev/null
+  ok "created docker context '$CTX' -> ssh://$DOCKER_SSH_HOST"
+elif [[ "$(docker context inspect "$CTX" --format '{{.Endpoints.docker.Host}}')" != "ssh://$DOCKER_SSH_HOST" ]]; then
+  docker context update "$CTX" --docker "host=ssh://$DOCKER_SSH_HOST" >/dev/null
+  ok "docker context '$CTX' now uses ssh://$DOCKER_SSH_HOST"
 fi
 export DOCKER_CONTEXT="$CTX"
 [[ "$(docker info --format '{{.Architecture}}' 2>/dev/null)" == aarch64 ]] \

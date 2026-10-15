@@ -47,22 +47,43 @@ exists on the Mac.
 
 ### SSH and Docker context (on the Mac)
 
-```bash
-ssh-copy-id umbrel@umbrel.local                  # key login; docker over ssh can't ask for a password
-ssh umbrel@umbrel.local docker ps                # must work WITHOUT sudo
-ssh umbrel@umbrel.local uname -m                 # must print aarch64 (64-bit OS)
-docker context create umbrel --docker "host=ssh://umbrel@umbrel.local"
-```
-
-Optional, but it makes every docker-over-ssh call much faster. In `~/.ssh/config`:
+Docker talks to the Pi through its own SSH host alias, `umbrel-docker`, that **never shares a
+connection** (`ControlMaster no`). With a shared connection (`ControlMaster auto`), a stale
+master made docker commands hang with no timeout, once in the middle of a deploy, with the old
+container stopped and the new one not started. Keep connection sharing, if you like it, on the
+`umbrel.local` alias you use interactively. In `~/.ssh/config`:
 
 ```
+# Interactive use (ssh umbrel.local): sharing a connection is fine here
 Host umbrel.local
   User umbrel
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%r@%h:%p
-  ControlPersist 10m
+  IdentityFile ~/.ssh/id_ed25519_umbrel
+  IdentitiesOnly yes
+
+# Docker over SSH (docker context "umbrel"): a fresh connection for every docker command
+Host umbrel-docker
+  HostName umbrel.local
+  User umbrel
+  IdentityFile ~/.ssh/id_ed25519_umbrel
+  IdentitiesOnly yes
+  ControlMaster no
+  ControlPath none
+  ServerAliveInterval 15
+  ServerAliveCountMax 4
 ```
+
+`ServerAlive*` makes a docker command fail after about a minute when the Pi stops answering,
+instead of hanging. Then:
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519_umbrel umbrel@umbrel.local   # key login; docker over ssh can't ask for a password
+ssh umbrel-docker docker ps                      # must work WITHOUT sudo
+ssh umbrel-docker uname -m                       # must print aarch64 (64-bit OS)
+docker context create umbrel --docker "host=ssh://umbrel-docker"
+```
+
+Already have the context from before? `docker context update umbrel --docker "host=ssh://umbrel-docker"`.
+`deploy.sh` warns when the context's SSH host shares connections.
 
 ### External drive for backups
 
