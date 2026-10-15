@@ -1,7 +1,8 @@
 // Container Health: umbrelOS widgets + a status page for the containers you run
 // yourself (LocalInfra, your projects), skipping the ones umbrelOS manages.
 //
-// Read-only by design: the only Docker API call is GET /containers/json.
+// Read-only by design: the only Docker API calls are GET /containers/json and, for
+// the status page only, GET /containers/<id>/stats (one-shot memory reading).
 // No dependencies; runs on a stock node:alpine image.
 //
 // This is a ".template" because umbrelOS app updates only copy whitelisted
@@ -9,6 +10,7 @@
 // envsubst, so this file must NOT contain the dollar sign at all: no template
 // literals, no regex end anchors. scripts/check-health-app.sh enforces it.
 import http from "node:http";
+import os from "node:os";
 
 const PORT = Number(process.env.PORT || 3000);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || "/var/run/docker.sock";
@@ -20,7 +22,11 @@ const EXCLUDE_WORKDIR_PREFIXES = (process.env.EXCLUDE_WORKDIR_PREFIXES || "/opt/
   .filter(Boolean);
 // Opt-out for one-off containers: docker run --label localinfra.health.hide=true ...
 const HIDE_LABEL = "localinfra.health.hide";
+// Optional public URL of an app (the app template sets it from NEXT_PUBLIC_APP_URL)
+const URL_LABEL = "localinfra.url";
 const REFRESH = process.env.WIDGET_REFRESH || "30s";
+// Memory readings are shared by every open status page for this long
+const MEMORY_TTL_MS = 10000;
 
 const STATES = {
   ok: { rank: 0, emoji: "✅", label: "Healthy" },
@@ -28,6 +34,15 @@ const STATES = {
   unhealthy: { rank: 2, emoji: "⚠️", label: "Unhealthy" },
   stopped: { rank: 3, emoji: "❌", label: "Stopped" },
 };
+
+// What LocalInfra provides. A container uses a resource when it joins its network.
+const RESOURCES = [
+  { key: "postgres", label: "Postgres", short: "PG", network: "localinfra_postgres", provider: "localinfra-postgres" },
+  { key: "redis", label: "Redis", short: "RD", network: "localinfra_redis", provider: "localinfra-redis" },
+  { key: "s3", label: "S3", short: "S3", network: "localinfra_s3", provider: "localinfra-s3" },
+  // Every app on this network can be reached by the umbrelOS Cloudflare Tunnel app
+  { key: "tunnel", label: "Tunnel", short: "CF", network: "umbrel_main_network", provider: null },
+];
 
 function dockerGet(path) {
   return new Promise((resolve, reject) => {
@@ -77,15 +92,32 @@ function isMine(container) {
 const worst = (states) =>
   states.reduce((a, b) => (STATES[b].rank > STATES[a].rank ? b : a), "ok");
 
-async function snapshot() {
-  const list = await dockerGet("/containers/json?all=true");
-  const containers = list.filter(isMine).map((c) => ({
-    name: (c.Names?.[0] || c.Id.slice(0, 12)).replace(/^\//, ""),
+function describe(c) {
+  const name = (c.Names?.[0] || c.Id.slice(0, 12)).replace(/^\//, "");
+  const networks = Object.keys(c.NetworkSettings?.Networks || {});
+  return {
+    id: c.Id,
+    name,
     project: c.Labels?.["com.docker.compose.project"] || null,
     state: classify(c),
+    running: c.State === "running" || c.State === "restarting",
     status: c.Status || c.State,
     image: c.Image,
-  }));
+    url: c.Labels?.[URL_LABEL] || null,
+    port: (c.Ports || []).find((p) => p.Type === "tcp")?.PrivatePort || 3000,
+    // A provider doesn't "use" its own network
+    uses: RESOURCES.filter((r) => networks.includes(r.network) && r.provider !== name).map((r) => r.key),
+  };
+}
+
+async function snapshot() {
+  const list = await dockerGet("/containers/json?all=true");
+  const containers = list.filter(isMine).map(describe);
+  // The tunnel is an umbrelOS app (not "mine"), found by its image. The umbrelOS
+  // Cloudflare Tunnel app runs a web UI and a connector: the connector is the tunnel.
+  const tunnels = list.filter((c) => /cloudflared/.test(c.Image || ""));
+  const cloudflared = tunnels.find((c) => /connector/.test(c.Image + " " + (c.Names?.[0] || ""))) || tunnels[0];
+  const tunnel = cloudflared ? describe(cloudflared) : null;
 
   // One group per compose project; containers outside compose stand alone
   const groups = new Map();
@@ -107,7 +139,49 @@ async function snapshot() {
   const counts = { ok: 0, starting: 0, unhealthy: 0, stopped: 0 };
   for (const c of containers) counts[c.state]++;
 
-  return { projects, containers, counts };
+  return { projects, containers, counts, tunnel };
+}
+
+// ---------------------------------------------------------------- memory
+// One one-shot stats call per running container, only while a status page is
+// open, cached for MEMORY_TTL_MS and at most 4 calls at a time.
+
+let memoryCache = { at: 0, byId: new Map(), pending: null };
+
+async function readMemory(id) {
+  const s = await dockerGet("/containers/" + id + "/stats?stream=false&one-shot=true");
+  const m = s.memory_stats || {};
+  const st = m.stats || {};
+  // Same number as `docker stats`: usage minus the page cache that can be dropped
+  const cache = st.inactive_file ?? st.total_inactive_file ?? 0;
+  const used = Math.max(0, (m.usage || 0) - cache);
+  // Without a limit Docker reports the host's memory
+  const limit = m.limit && m.limit < os.totalmem() * 0.98 ? m.limit : null;
+  return m.usage == null ? null : { used, limit };
+}
+
+async function memoryFor(targets) {
+  if (Date.now() - memoryCache.at < MEMORY_TTL_MS) return memoryCache.byId;
+  if (memoryCache.pending) return memoryCache.pending;
+  memoryCache.pending = (async () => {
+    const byId = new Map();
+    const queue = targets.filter((c) => c && c.running);
+    const worker = async () => {
+      while (queue.length) {
+        const c = queue.shift();
+        try {
+          const reading = await readMemory(c.id);
+          if (reading) byId.set(c.id, reading);
+        } catch {
+          // left blank on the page
+        }
+      }
+    };
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    memoryCache = { at: Date.now(), byId, pending: null };
+    return byId;
+  })().finally(() => (memoryCache.pending = null));
+  return memoryCache.pending;
 }
 
 // ---------------------------------------------------------------- widgets
@@ -204,71 +278,500 @@ function totals({ projects, containers, counts }) {
 const escape = (s) =>
   String(s).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
 
+function bytes(n) {
+  if (n == null) return "–";
+  const mib = n / 1048576;
+  if (mib >= 1024) return (mib / 1024).toFixed(1) + " GiB";
+  return (mib >= 100 ? mib.toFixed(0) : mib.toFixed(1)) + " MiB";
+}
+
+const pct = (part, whole) => (whole ? Math.min(100, Math.max(1, (part / whole) * 100)).toFixed(1) : "0");
+
+const hostname = (url) => {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+};
+
+// Stroke icons in the Tabler style umbrelOS uses
+const ICONS = {
+  postgres: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6M4.5 12v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-6"/>',
+  redis: '<path d="m12 4-8 4 8 4 8-4-8-4zM4 12l8 4 8-4M4 16l8 4 8-4"/>',
+  s3: '<path d="M4 6.5c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5S16.4 4 12 4 4 5.1 4 6.5zm0 0 1.8 12c.2 1.4 2.9 2.3 6.2 2.3s6-.9 6.2-2.3L20 6.5"/>',
+  tunnel: '<path d="M7 18.5a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9a4.3 4.3 0 0 1-.4 9.5H7z"/>',
+  google: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M12.5 12h7"/>',
+  out: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+  copy: '<rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2.5"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  chevron: '<path d="m6 9 6 6 6-6"/>',
+  pulse: '<path d="M3 12h4l2.5-6 5 12 2.5-6h4"/>',
+};
+const icon = (name, cls) =>
+  '<svg class="ic' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  ICONS[name] + "</svg>";
+
 const STYLE = [
-  ":root { color-scheme: dark; --bg: #0b0b12; --card: rgba(255,255,255,.06); --line: rgba(255,255,255,.1); --muted: rgba(255,255,255,.55); }",
+  ":root { color-scheme: dark; --bg: #06060b; --text: #ececf4; --muted: rgba(236,236,244,.56); --faint: rgba(236,236,244,.3);",
+  "  --line: rgba(255,255,255,.08); --ok: #4ade80; --warn: #fbbf24; --bad: #fb7185; --idle: #94a3b8;",
+  "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
+  "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
   "* { box-sizing: border-box; }",
-  "body { margin: 0; min-height: 100vh; font: 14px/1.4 system-ui, -apple-system, sans-serif; color: #fff;",
-  "  background: radial-gradient(1200px 600px at 20% -10%, #3b2a6b 0%, transparent 60%), radial-gradient(900px 500px at 110% 10%, #123a5a 0%, transparent 55%), var(--bg); }",
-  "main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }",
-  "h1 { font-size: 22px; margin: 0 0 4px; } .sub { color: var(--muted); margin: 0 0 24px; }",
-  ".tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 24px; }",
-  ".tile, section { background: var(--card); border: 1px solid var(--line); border-radius: 16px; backdrop-filter: blur(20px); }",
-  ".tile { padding: 14px; text-align: center; } .tile b { display: block; font-size: 24px; } .tile span { color: var(--muted); font-size: 12px; }",
-  "section { padding: 14px 16px; margin-bottom: 12px; }",
-  "h2 { font-size: 15px; margin: 0 0 8px; } h2 small { color: var(--muted); font-weight: 400; margin-left: 6px; }",
-  "ul { list-style: none; margin: 0; padding: 0; }",
-  "li { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); align-items: baseline; }",
-  "li b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } li em { color: var(--muted); font-style: normal; font-size: 12px; text-align: right; }",
-  "li.unhealthy em, li.stopped em { color: #ffb4a8; }",
-  ".empty { color: var(--muted); }",
-  "@media (max-width: 480px) { .tiles { grid-template-columns: repeat(2, 1fr); } li { grid-template-columns: 22px minmax(0, 1fr); } li em { grid-column: 2; text-align: left; } }",
+  "html { background: var(--bg); }",
+  "body { margin: 0; min-height: 100vh; color: var(--text); font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; -webkit-font-smoothing: antialiased;",
+  "  background: radial-gradient(720px 420px at 8% -10%, rgba(167,139,250,.2), transparent 70%), radial-gradient(640px 420px at 100% 0%, rgba(34,211,238,.13), transparent 70%),",
+  "  radial-gradient(900px 520px at 50% 115%, rgba(244,114,182,.08), transparent 70%), var(--bg); background-attachment: fixed; }",
+  "body::before { content: ''; position: fixed; inset: 0; pointer-events: none; background-image: radial-gradient(rgba(255,255,255,.07) 1px, transparent 1px);",
+  "  background-size: 22px 22px; -webkit-mask-image: linear-gradient(#000, transparent 75%); mask-image: linear-gradient(#000, transparent 75%); }",
+  "main { position: relative; max-width: 920px; margin: 0 auto; padding: 28px 16px 56px; }",
+  "a { color: inherit; }",
+  ".ic { width: 18px; height: 18px; flex: none; }",
+  ".glass { background: linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.02)); border: 1px solid var(--line); border-radius: 18px;",
+  "  -webkit-backdrop-filter: blur(18px) saturate(150%); backdrop-filter: blur(18px) saturate(150%); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 14px 40px -16px rgba(0,0,0,.7); }",
+
+  // header
+  ".top { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }",
+  ".logo { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; color: var(--neon); border: 1px solid rgba(34,211,238,.35);",
+  "  background: radial-gradient(circle at 30% 20%, rgba(34,211,238,.25), rgba(167,139,250,.12)); box-shadow: 0 0 24px -4px rgba(34,211,238,.45); }",
+  ".brand { display: flex; align-items: center; gap: 14px; min-width: 0; }",
+  "h1 { font-size: 19px; font-weight: 600; letter-spacing: -.01em; margin: 0; }",
+  ".sub { color: var(--muted); font-size: 12.5px; display: flex; align-items: center; gap: 7px; margin-top: 1px; }",
+  ".beat { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: pulse 2.4s ease-in-out infinite; }",
+  ".beat.off { background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: none; }",
+  "@keyframes pulse { 50% { opacity: .35; } }",
+  ".links { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }",
+  ".btn { display: inline-flex; align-items: center; gap: 7px; height: 34px; padding: 0 13px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.04);",
+  "  color: var(--text); text-decoration: none; font-size: 12.5px; transition: border-color .2s, box-shadow .2s; }",
+  ".btn .ic { width: 15px; height: 15px; color: var(--c, var(--neon)); }",
+  ".btn:hover, .btn:focus-visible { outline: none; border-color: color-mix(in srgb, var(--c, var(--neon)) 55%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--c, var(--neon)) 12%, transparent), 0 0 20px -4px var(--c, var(--neon)); }",
+
+  // tiles
+  ".tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }",
+  ".tile { padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }",
+  ".tile .k { font-size: 11px; color: var(--muted); letter-spacing: .07em; text-transform: uppercase; }",
+  ".tile b { font-size: 26px; font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }",
+  ".tile b em { font-style: normal; color: var(--faint); font-weight: 500; font-size: 17px; margin-left: 2px; }",
+  ".tile .s { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".tile.bad b { color: var(--bad); text-shadow: 0 0 18px rgba(251,113,133,.5); }",
+  ".tile.good b { color: var(--ok); text-shadow: 0 0 18px rgba(74,222,128,.35); }",
+  ".tile .bar { margin-top: 8px; }",
+
+  // section titles
+  "h2 { font-size: 11.5px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .09em; margin: 28px 4px 10px; }",
+
+  // status dots
+  ".dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--sc); box-shadow: 0 0 0 3px color-mix(in srgb, var(--sc) 16%, transparent), 0 0 10px var(--sc); }",
+  ".st-ok { --sc: var(--ok); } .st-starting { --sc: var(--warn); } .st-unhealthy { --sc: var(--bad); } .st-stopped { --sc: var(--bad); } .st-unknown { --sc: var(--idle); }",
+
+  // resource map
+  ".map { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(36px, .8fr) minmax(0, 1fr); padding: 18px 16px; }",
+  ".col { display: flex; flex-direction: column; justify-content: space-around; height: var(--h); min-width: 0; }",
+  ".col.l { align-items: flex-end; } .col.r { align-items: flex-start; }",
+  ".pill { display: flex; align-items: center; gap: 10px; max-width: 100%; height: 44px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line);",
+  "  background: rgba(255,255,255,.035); transition: border-color .2s, box-shadow .2s, opacity .2s; cursor: default; }",
+  ".pill .t { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }",
+  ".pill b { font-weight: 500; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".pill small { color: var(--muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".res { height: 54px; padding: 0 14px 0 9px; border-radius: 16px; border-color: color-mix(in srgb, var(--c) 32%, transparent);",
+  "  background: linear-gradient(90deg, color-mix(in srgb, var(--c) 9%, transparent), rgba(255,255,255,.02)); box-shadow: 0 0 26px -12px var(--c); }",
+  ".res .ico { width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center; flex: none; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }",
+  ".res .dot { margin-left: 4px; }",
+  "svg.edges { width: 100%; height: var(--h); overflow: visible; }",
+  "svg.edges path { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; transition: opacity .2s; }",
+  "svg.edges path.glow { stroke-width: 6; opacity: .1; }",
+  "svg.edges path.line { opacity: .5; }",
+  "svg.edges path.flow { stroke-width: 2.2; stroke-linecap: round; stroke-dasharray: 1 27; animation: flow 2.4s linear infinite; }",
+  "@keyframes flow { to { stroke-dashoffset: -28; } }",
+  ".map.focus svg.edges path { opacity: .05; } .map.focus svg.edges path.glow.on { opacity: .28; } .map.focus svg.edges path.on { opacity: 1; }",
+  ".map.focus .pill { opacity: .45; } .map.focus .pill.on { opacity: 1; border-color: rgba(255,255,255,.25); }",
+  ".empty { color: var(--muted); padding: 18px; }",
+
+  // projects
+  ".proj { padding: 4px 16px; margin-bottom: 10px; }",
+  ".proj-h { display: flex; align-items: center; gap: 10px; padding: 12px 0; }",
+  ".proj-h h3 { margin: 0; font-size: 14.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".proj-h .n { color: var(--muted); font-size: 12px; white-space: nowrap; }",
+  ".proj-h .m { margin-left: auto; font: 12px var(--mono); color: var(--muted); white-space: nowrap; }",
+  ".rows { list-style: none; margin: 0; padding: 0; }",
+  ".row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto 150px; gap: 6px 14px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line); }",
+  ".who { min-width: 0; } .who b { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".who small { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".row.st-unhealthy .who small, .row.st-stopped .who small { color: var(--bad); }",
+  ".chips { display: flex; gap: 5px; flex-wrap: wrap; }",
+  ".rc { font: 600 10px/1 var(--mono); letter-spacing: .05em; padding: 4px 7px; border-radius: 999px; color: var(--c); background: color-mix(in srgb, var(--c) 11%, transparent);",
+  "  border: 1px solid color-mix(in srgb, var(--c) 32%, transparent); }",
+  ".mem { display: flex; flex-direction: column; gap: 6px; min-width: 0; }",
+  ".mem span { font: 12px var(--mono); text-align: right; white-space: nowrap; } .mem em { color: var(--faint); font-style: normal; }",
+  ".bar { display: block; position: relative; height: 4px; border-radius: 4px; background: rgba(255,255,255,.07); overflow: hidden; }",
+  ".bar i { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: linear-gradient(90deg, var(--neon2), var(--neon)); box-shadow: 0 0 10px rgba(34,211,238,.6); }",
+  ".bar i.host { background: rgba(255,255,255,.14); box-shadow: none; }",
+  ".bar.hot i { background: linear-gradient(90deg, var(--warn), var(--bad)); box-shadow: 0 0 10px rgba(251,113,133,.6); }",
+
+  // guides
+  ".ghead { display: flex; align-items: flex-end; gap: 10px 12px; flex-wrap: wrap; margin: 28px 4px 10px; }",
+  ".ghead h2 { margin: 0 auto 0 0; }",
+  ".field { display: flex; align-items: center; gap: 4px; height: 34px; padding: 0 4px 0 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.04); min-width: 0; }",
+  ".field span { font-size: 11.5px; color: var(--muted); }",
+  ".field select, .field input { min-width: 0; height: 100%; background: transparent; border: 0; outline: none; color: var(--text); font: 12.5px var(--mono); padding: 0 8px; }",
+  ".field input { width: 150px; } .field select option { background: #14141c; }",
+  ".field:focus-within { border-color: rgba(34,211,238,.5); box-shadow: 0 0 0 3px rgba(34,211,238,.1); }",
+  "details.guide { margin-bottom: 10px; overflow: hidden; }",
+  "summary { list-style: none; display: flex; align-items: center; gap: 12px; padding: 14px 16px; cursor: pointer; }",
+  "summary::-webkit-details-marker { display: none; }",
+  "summary:focus-visible { outline: 2px solid rgba(34,211,238,.6); outline-offset: -2px; border-radius: 18px; }",
+  ".gi { width: 36px; height: 36px; border-radius: 12px; display: grid; place-items: center; flex: none; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent);",
+  "  box-shadow: 0 0 22px -6px var(--c); }",
+  "summary b { display: block; font-weight: 600; font-size: 14px; } summary small { color: var(--muted); font-size: 12px; }",
+  ".chev { margin-left: auto; color: var(--muted); transition: transform .2s; } details[open] .chev { transform: rotate(180deg); }",
+  ".gbody { padding: 0 16px 16px; }",
+  ".gbody > .btn { margin-bottom: 12px; }",
+  ".steps { list-style: none; counter-reset: s; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 14px; background: rgba(0,0,0,.22); overflow: hidden; }",
+  ".steps li { counter-increment: s; position: relative; padding: 13px 16px 13px 48px; border-top: 1px solid var(--line); line-height: 1.9; }",
+  ".steps li:first-child { border-top: 0; }",
+  ".steps li::before { content: counter(s); position: absolute; left: 15px; top: 14px; width: 21px; height: 21px; border-radius: 50%; display: grid; place-items: center;",
+  "  font: 600 11px/1 var(--mono); color: var(--c); border: 1px solid color-mix(in srgb, var(--c) 45%, transparent); box-shadow: 0 0 12px -4px var(--c); }",
+  ".steps li.warn { counter-increment: none; background: rgba(251,191,36,.07); color: #fde68a; }",
+  ".steps li.warn::before { content: '!'; color: var(--warn); border-color: rgba(251,191,36,.5); }",
+  ".steps li[hidden] { display: none; }",
+  ".steps .note { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.5; margin-top: 2px; }",
+  ".chip { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; vertical-align: middle; padding: 2px 2px 2px 10px; border-radius: 9px;",
+  "  background: rgba(255,255,255,.06); border: 1px solid var(--line); font: 12.5px/1.5 var(--mono); }",
+  ".chip code { font: inherit; overflow-wrap: anywhere; } .chip.ph code { color: var(--faint); }",
+  ".cp { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }",
+  ".cp:hover, .cp:focus-visible { outline: none; color: var(--neon); background: rgba(34,211,238,.1); }",
+  ".cp .ic { width: 15px; height: 15px; } .cp .ok { display: none; } .cp.done .cp-i { display: none; } .cp.done .ok { display: block; color: var(--ok); }",
+  "kbd { font: 12px var(--mono); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.05); }",
+  "footer { margin-top: 28px; text-align: center; color: var(--faint); font-size: 12px; }",
+
+  "@media (max-width: 640px) {",
+  "  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }",
+  "  .links { margin-left: 0; width: 100%; } .sub .extra { display: none; }",
+  "  .map { padding: 14px 10px; grid-template-columns: minmax(0, 1.25fr) minmax(24px, .45fr) minmax(0, 1fr); }",
+  "  .pill { padding: 0 11px; gap: 8px; } .res { padding: 0 10px 0 7px; } .res .ico { width: 28px; height: 28px; } .res .dot { display: none; }",
+  "  .row { grid-template-columns: 8px minmax(0, 1fr) 112px; } .row .chips { grid-column: 2; grid-row: 2; } .row .mem { grid-column: 3; grid-row: 1 / span 2; }",
+  "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
+  "  .mem em { display: none; } .steps li { line-height: 1.7; }",
+  "}",
+  "@media (prefers-reduced-motion: reduce) { svg.edges path.flow, .beat { animation: none; } }",
 ].join("\n");
 
-function containerRow(c) {
+const resourceStyle = (r) => "--c: var(--" + r.key + ")";
+
+function memoryCell(reading) {
+  if (!reading) return '<div class="mem"><span><em>–</em></span></div>';
+  const whole = reading.limit || os.totalmem();
+  const share = reading.used / whole;
   return (
-    '<li class="' + c.state + '"><span>' + STATES[c.state].emoji + "</span><b>" + escape(c.name) +
-    "</b><em>" + escape(c.status) + "</em></li>"
+    '<div class="mem" title="' + (reading.limit ? "Memory limit " + bytes(reading.limit) : "No memory limit: share of the Pi's memory") + '">' +
+    "<span>" + bytes(reading.used) + (reading.limit ? "<em> / " + bytes(reading.limit) + "</em>" : "") + "</span>" +
+    '<i class="bar' + (share > 0.85 ? " hot" : "") + '"><i style="width:' + pct(reading.used, whole) + '%"></i></i></div>'
   );
 }
 
-function projectSection(p) {
+function tiles(snap, mem) {
+  const t = totals(snap);
+  let mine = 0;
+  for (const c of snap.containers) mine += mem.get(c.id)?.used || 0;
+  const total = os.totalmem();
+  const hostUsed = total - os.freemem();
+  const tile = (cls, k, value, of, sub, extra) =>
+    '<div class="tile glass' + (cls ? " " + cls : "") + '"><span class="k">' + k + "</span><b>" + value +
+    (of != null ? "<em>/" + of + "</em>" : "") + '</b><span class="s">' + sub + "</span>" + (extra || "") + "</div>";
   return (
-    "<section><h2>" + STATES[p.state].emoji + " " + escape(p.name) + " <small>" + p.ok + "/" +
-    p.containers.length + " healthy</small></h2><ul>" + p.containers.map(containerRow).join("") +
-    "</ul></section>"
+    '<div class="tiles">' +
+    tile("", "Containers", t.okContainers, t.containers, "healthy") +
+    tile("", "Projects", t.okProjects, t.projects, "healthy") +
+    tile(t.issues ? "bad" : "good", "Issues", t.issues, null, t.issues ? "need a look" : "all clear") +
+    tile("", "Memory", escape(bytes(mine)), null, "Pi " + bytes(hostUsed) + " / " + bytes(total),
+      '<i class="bar"><i class="host" style="width:' + pct(hostUsed, total) + '%"></i><i style="width:' + pct(mine, total) + '%"></i></i>') +
+    "</div>"
   );
 }
+
+function resourceMap(snap, mem) {
+  const byName = new Map(snap.containers.map((c) => [c.name, c]));
+  const apps = snap.containers
+    .filter((c) => c.uses.length)
+    .sort((a, b) => (a.project || a.name).localeCompare(b.project || b.name) || a.name.localeCompare(b.name));
+  if (!apps.length) {
+    return '<div class="glass empty">No container uses LocalInfra yet. Join a <code>localinfra_*</code> network to show up here.</div>';
+  }
+  const H = Math.max(apps.length * 58, RESOURCES.length * 66);
+  const yApp = (i) => ((i + 0.5) * H) / apps.length;
+  const yRes = (j) => ((j + 0.5) * H) / RESOURCES.length;
+
+  let edges = "";
+  apps.forEach((c, i) => {
+    for (const key of c.uses) {
+      const j = RESOURCES.findIndex((r) => r.key === key);
+      const a = yApp(i).toFixed(1);
+      const b = yRes(j).toFixed(1);
+      const d = "M0 " + a + " C50 " + a + " 50 " + b + " 100 " + b;
+      const data = ' data-app="' + escape(c.name) + '" data-res="' + key + '" stroke="var(--' + key + ')"';
+      edges += ["glow", "line", "flow"].map((cls) => '<path class="' + cls + '" d="' + d + '"' + data + "/>").join("");
+    }
+  });
+
+  const left = apps
+    .map((c) => {
+      const host = c.url && hostname(c.url);
+      const sub = host || (c.project && c.project !== c.name ? c.project : "");
+      return (
+        '<div class="pill" data-app="' + escape(c.name) + '" title="' + escape(c.name + " · " + c.status) + '"><span class="dot st-' + c.state + '"></span>' +
+        '<span class="t"><b>' + escape(c.name) + "</b>" + (sub ? "<small>" + escape(sub) + "</small>" : "") + "</span></div>"
+      );
+    })
+    .join("");
+
+  const right = RESOURCES.map((r) => {
+    const provider = r.provider ? byName.get(r.provider) : snap.tunnel;
+    const users = apps.filter((c) => c.uses.includes(r.key)).length;
+    const reading = provider && mem.get(provider.id);
+    const sub = users + (users === 1 ? " app" : " apps") + (reading ? " · " + bytes(reading.used) : "");
+    const state = provider ? provider.state : "unknown";
+    return (
+      '<div class="pill res" data-res="' + r.key + '" style="' + resourceStyle(r) + '" title="' +
+      escape((provider ? provider.name + " · " + provider.status : r.label + ": container not found") + " · network " + r.network) + '">' +
+      '<span class="ico">' + icon(r.key) + '</span><span class="t"><b>' + r.label + "</b><small>" + sub + "</small></span>" +
+      '<span class="dot st-' + state + '"></span></div>'
+    );
+  }).join("");
+
+  return (
+    '<div class="map glass" style="--h:' + H + 'px">' +
+    '<div class="col l">' + left + "</div>" +
+    '<svg class="edges" viewBox="0 0 100 ' + H + '" preserveAspectRatio="none" aria-hidden="true">' + edges + "</svg>" +
+    '<div class="col r">' + right + "</div></div>"
+  );
+}
+
+function containerRow(c, mem) {
+  const chips = c.uses
+    .map((key) => {
+      const r = RESOURCES.find((x) => x.key === key);
+      return '<span class="rc" style="' + resourceStyle(r) + '" title="' + r.label + " (" + r.network + ')">' + r.short + "</span>";
+    })
+    .join("");
+  return (
+    '<li class="row st-' + c.state + '"><span class="dot"></span>' +
+    '<div class="who"><b>' + escape(c.name) + "</b><small>" + escape(c.status) + "</small></div>" +
+    '<div class="chips">' + chips + "</div>" + memoryCell(mem.get(c.id)) + "</li>"
+  );
+}
+
+function projectCard(p, mem) {
+  let used = 0;
+  for (const c of p.containers) used += mem.get(c.id)?.used || 0;
+  return (
+    '<section class="proj glass"><div class="proj-h"><span class="dot st-' + p.state + '"></span><h3>' + escape(p.name) + "</h3>" +
+    '<span class="n">' + p.ok + "/" + p.containers.length + " healthy</span>" +
+    '<span class="m">' + (used ? bytes(used) : "") + "</span></div>" +
+    '<ul class="rows">' + p.containers.map((c) => containerRow(c, mem)).join("") + "</ul></section>"
+  );
+}
+
+// The part of the page that refreshes itself (GET /live every 15s)
+async function livePart() {
+  try {
+    const snap = await snapshot();
+    const mem = await memoryFor([...snap.containers, snap.tunnel]);
+    return {
+      snap,
+      html:
+        tiles(snap, mem) +
+        "<h2>Resource map</h2>" + resourceMap(snap, mem) +
+        "<h2>Projects</h2>" +
+        (snap.projects.length
+          ? snap.projects.map((p) => projectCard(p, mem)).join("")
+          : '<div class="glass empty">No containers of yours yet.</div>'),
+    };
+  } catch (error) {
+    return { snap: null, html: '<div class="glass empty">❗ Docker unavailable: ' + escape(error.message) + "</div>" };
+  }
+}
+
+const chip = (key, fallback) =>
+  '<span class="chip' + (key ? '" data-chip="' + key : "") + '"><code' + (key ? ' data-k="' + key + '"' : "") + ">" + escape(fallback) + "</code>" +
+  '<button type="button" class="cp" title="Copy" aria-label="Copy">' + icon("copy", "cp-i") + icon("check", "ok") + "</button></span>";
+
+function guides(snap) {
+  const apps = (snap ? snap.containers : []).filter((c) => c.project !== "localinfra" && !RESOURCES.some((r) => r.provider === c.name));
+  // Suggest the domain the published apps already use
+  let domain = "";
+  for (const c of apps) {
+    const host = c.url && hostname(c.url);
+    if (host && host.split(".").length > 2) {
+      domain = host.split(".").slice(1).join(".");
+      break;
+    }
+  }
+  const options = apps.length
+    ? apps
+        .map((c) => {
+          const host = c.url && hostname(c.url);
+          return (
+            '<option value="' + escape(c.name) + '" data-port="' + c.port + '" data-tunnel="' + (c.uses.includes("tunnel") ? 1 : 0) + '"' +
+            (host ? ' data-sub="' + escape(host.split(".")[0]) + '"' : "") + ">" + escape(c.name) + "</option>"
+          );
+        })
+        .join("")
+    : '<option value="myapp" data-port="3000" data-tunnel="1">myapp</option>';
+
+  const cloudflare =
+    '<details class="guide glass" style="--c: var(--tunnel)" id="guide-cloudflare">' +
+    '<summary><span class="gi">' + icon("tunnel") + "</span><div><b>Publish an app on Cloudflare</b>" +
+    "<small>Add a route to the tunnel so the app gets a public HTTPS address</small></div>" + icon("chevron", "chev") + "</summary>" +
+    '<div class="gbody">' +
+    '<a class="btn" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Cloudflare Zero Trust</a>" +
+    '<ol class="steps">' +
+    '<li class="warn" data-if="notunnel" hidden>This container is not on ' + chip(null, "umbrel_main_network") +
+    ', so the tunnel can\'t reach it. Add it to the networks in the app\'s compose file and run <kbd>./deploy.sh</kbd>.</li>' +
+    "<li>In Zero Trust go to <b>Networks → Tunnels</b> and open the tunnel of the Umbrel Cloudflare Tunnel app.</li>" +
+    "<li>Open the <b>Published application routes</b> tab and click <b>Add a published application route</b>.</li>" +
+    "<li>Subdomain " + chip("sub", "myapp") + " Domain " + chip("domain", "example.com") +
+    '<span class="note">Leave Path empty.</span></li>' +
+    "<li>Service type " + chip(null, "HTTP") + " URL " + chip("svc", "myapp:3000") +
+    '<span class="note">The container name and its internal port, not the LAN port.</span></li>' +
+    "<li>Click <b>Save</b>. In a few seconds the app answers on " + chip("origin", "https://myapp.example.com") + "</li>" +
+    "<li>Put the address in the app's <kbd>.env</kbd> and run <kbd>./deploy.sh</kbd> " + chip("envurl", "NEXT_PUBLIC_APP_URL=https://myapp.example.com") +
+    '<span class="note">Also BETTER_AUTH_URL if the app has it. NEXT_PUBLIC_* is baked in at build time, so a redeploy is needed.</span></li>' +
+    "</ol></div></details>";
+
+  const google =
+    '<details class="guide glass" style="--c: var(--postgres)" id="guide-google">' +
+    '<summary><span class="gi">' + icon("google") + "</span><div><b>Add Google sign-in</b>" +
+    "<small>Create an OAuth client in Google Cloud Console</small></div>" + icon("chevron", "chev") + "</summary>" +
+    '<div class="gbody">' +
+    '<a class="btn" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Google Cloud Console</a>" +
+    '<ol class="steps">' +
+    "<li>Pick the project in the top bar, or create one for the app.</li>" +
+    "<li><b>Google Auth Platform → Branding</b>: app name and support email. Under Authorized domains add " + chip("domain", "example.com") +
+    '<span class="note">The first time, this is the Get started wizard.</span></li>' +
+    "<li><b>Audience</b>: External. While it says Testing, only the test users listed there can sign in; <b>Publish app</b> opens it to everyone." +
+    '<span class="note">Email and profile scopes need no Google review.</span></li>' +
+    "<li><b>Clients → Create client</b>, type " + chip(null, "Web application") + " name " + chip("name", "myapp") + "</li>" +
+    "<li>Authorized JavaScript origins → Add URI " + chip("origin", "https://myapp.example.com") + "</li>" +
+    "<li>Authorized redirect URIs → Add URI " + chip("redirect", "https://myapp.example.com/api/auth/callback/google") +
+    '<span class="note">For local dev, add http://localhost:3000 and http://localhost:3000/api/auth/callback/google too.</span></li>' +
+    "<li>Click <b>Create</b> and copy both values into the app's <kbd>.env</kbd> right away, the secret is shown only once. " +
+    chip(null, "GOOGLE_CLIENT_ID") + " " + chip(null, "GOOGLE_CLIENT_SECRET") + " Then <kbd>./deploy.sh</kbd>.</li>" +
+    "</ol></div></details>";
+
+  return (
+    '<div class="ghead"><h2>Guides</h2>' +
+    '<label class="field"><span>App</span><select id="g-app">' + options + "</select></label>" +
+    '<label class="field"><span>Domain</span><input id="g-domain" placeholder="example.com" spellcheck="false" autocomplete="off" value="' +
+    escape(domain) + '"></label></div>' +
+    cloudflare + google
+  );
+}
+
+// Client side: refresh the live part, map highlighting, guide values, copy buttons
+const SCRIPT = [
+  "(function () {",
+  "  var live = document.getElementById('live'), beat = document.getElementById('beat'), stamp = document.getElementById('stamp');",
+  "  function now() { stamp.textContent = 'updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }",
+  "  function refresh() {",
+  "    if (document.hidden) return;",
+  "    fetch('live', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })",
+  "      .then(function (html) { live.innerHTML = html; beat.classList.remove('off'); now(); })",
+  "      .catch(function () { beat.classList.add('off'); stamp.textContent = 'offline, retrying'; });",
+  "  }",
+  "  now();",
+  "  setInterval(refresh, 15000);",
+  "  document.addEventListener('visibilitychange', refresh);",
+  "",
+  "  // Hover an app or a resource on the map: light up its links, dim the rest",
+  "  function focus(node) {",
+  "    var map = live.querySelector('.map'); if (!map) return;",
+  "    map.classList.toggle('focus', !!node);",
+  "    if (!node) return;",
+  "    var app = node.getAttribute('data-app'), res = node.getAttribute('data-res');",
+  "    var linked = function (a, r) { return app ? a === app : r === res; };",
+  "    map.querySelectorAll('path').forEach(function (p) { p.classList.toggle('on', linked(p.getAttribute('data-app'), p.getAttribute('data-res'))); });",
+  "    map.querySelectorAll('.pill').forEach(function (el) {",
+  "      var on = el === node || !!map.querySelector(el.hasAttribute('data-app')",
+  "        ? 'path.on[data-app=\"' + CSS.escape(el.getAttribute('data-app')) + '\"]'",
+  "        : 'path.on[data-res=\"' + el.getAttribute('data-res') + '\"]');",
+  "      el.classList.toggle('on', on);",
+  "    });",
+  "  }",
+  "  live.addEventListener('mouseover', function (e) { focus(e.target.closest('.map .pill')); });",
+  "  live.addEventListener('mouseleave', function () { focus(null); });",
+  "",
+  "  var app = document.getElementById('g-app'), dom = document.getElementById('g-domain');",
+  "  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }",
+  "  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }",
+  "  var savedApp = load('lih.app'), savedDomain = load('lih.domain');",
+  "  if (savedApp && app.querySelector('option[value=\"' + CSS.escape(savedApp) + '\"]')) app.value = savedApp;",
+  "  if (savedDomain) dom.value = savedDomain;",
+  "  function fill() {",
+  "    var o = app.options[app.selectedIndex], name = o ? o.value : 'myapp';",
+  "    var sub = (o && o.getAttribute('data-sub')) || name, d = dom.value.trim().toLowerCase(), real = !!d;",
+  "    d = d || 'example.com';",
+  "    var origin = 'https://' + sub + '.' + d;",
+  "    var v = { name: name, sub: sub, domain: d, svc: name + ':' + ((o && o.getAttribute('data-port')) || '3000'), origin: origin,",
+  "      redirect: origin + '/api/auth/callback/google', envurl: 'NEXT_PUBLIC_APP_URL=' + origin };",
+  "    document.querySelectorAll('[data-k]').forEach(function (el) {",
+  "      var k = el.getAttribute('data-k'); el.textContent = v[k];",
+  "      el.parentNode.classList.toggle('ph', !real && k !== 'name' && k !== 'svc' && k !== 'sub');",
+  "    });",
+  "    document.querySelectorAll('[data-if=\"notunnel\"]').forEach(function (el) { el.hidden = !o || o.getAttribute('data-tunnel') === '1'; });",
+  "  }",
+  "  app.addEventListener('change', function () { save('lih.app', app.value); fill(); });",
+  "  dom.addEventListener('input', function () { save('lih.domain', dom.value.trim()); fill(); });",
+  "  fill();",
+  "",
+  "  // http://umbrel.local is not a secure context, so navigator.clipboard is often missing",
+  "  // and if the browser refuses both ways the value is left selected for a manual copy",
+  "  function copy(code, done) {",
+  "    var text = code.textContent;",
+  "    function select() { var r = document.createRange(); r.selectNodeContents(code); var s = getSelection(); s.removeAllRanges(); s.addRange(r); }",
+  "    function legacy() {",
+  "      var t = document.createElement('textarea'), ok = false; t.value = text; t.setAttribute('readonly', '');",
+  "      t.style.position = 'fixed'; t.style.opacity = '0'; document.body.appendChild(t); t.select();",
+  "      try { ok = document.execCommand('copy'); } catch (e) {}",
+  "      document.body.removeChild(t);",
+  "      if (ok) done(); else select();",
+  "    }",
+  "    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, legacy); else legacy();",
+  "  }",
+  "  document.addEventListener('click', function (e) {",
+  "    var b = e.target.closest('.cp'); if (!b) return;",
+  "    copy(b.parentNode.querySelector('code'), function () {",
+  "      b.classList.add('done'); setTimeout(function () { b.classList.remove('done'); }, 1400);",
+  "    });",
+  "  });",
+  "})();",
+].join("\n");
 
 async function statusPage() {
-  let body;
-  try {
-    const { projects, counts } = await snapshot();
-    const tiles = Object.entries(STATES)
-      .map(([key, s]) => '<div class="tile"><b>' + counts[key] + "</b><span>" + s.label + "</span></div>")
-      .join("");
-    const sections = projects.length
-      ? projects.map(projectSection).join("")
-      : '<p class="empty">No containers of yours yet.</p>';
-    body = '<div class="tiles">' + tiles + "</div>" + sections;
-  } catch (error) {
-    body = '<p class="empty">❗ Docker unavailable: ' + escape(error.message) + "</p>";
-  }
-
+  const { snap, html } = await livePart();
   return [
     "<!doctype html>",
     '<html lang="en">',
     "<head>",
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
-    '<meta http-equiv="refresh" content="15">',
+    '<meta name="theme-color" content="#06060b">',
     "<title>Container Health</title>",
     "<style>" + STYLE + "</style>",
     "</head>",
     "<body><main>",
-    "<h1>Container Health</h1>",
-    '<p class="sub">Containers you run on this Umbrel (apps managed by umbrelOS are hidden). Refreshes every 15s.</p>',
-    body,
-    "</main></body>",
+    '<header class="top"><div class="brand"><span class="logo">' + icon("pulse") + "</span>",
+    '<div><h1>Container Health</h1><div class="sub"><span class="beat" id="beat"></span><span id="stamp"></span>' +
+      '<span class="extra">· your containers, umbrelOS apps hidden</span></div></div></div>',
+    '<nav class="links">' +
+      '<a class="btn" style="--c: var(--tunnel)" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("tunnel") + "Cloudflare</a>" +
+      '<a class="btn" style="--c: var(--postgres)" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + icon("google") + "Google Cloud</a>" +
+      "</nav></header>",
+    '<div id="live">' + html + "</div>",
+    guides(snap),
+    "<footer>Read-only: this page only lists containers and reads their memory.</footer>",
+    "</main>",
+    "<script>" + SCRIPT + "</script>",
+    "</body>",
     "</html>",
   ].join("\n");
 }
@@ -280,6 +783,7 @@ const routes = {
   "/widgets/summary": async () => ({ type: "application/json", body: JSON.stringify(await summaryWidget()) }),
   "/widgets/gauges": async () => ({ type: "application/json", body: JSON.stringify(await gaugesWidget()) }),
   "/healthz": async () => ({ type: "text/plain", body: "ok" }),
+  "/live": async () => ({ type: "text/html; charset=utf-8", body: (await livePart()).html }),
   "/": async () => ({ type: "text/html; charset=utf-8", body: await statusPage() }),
 };
 

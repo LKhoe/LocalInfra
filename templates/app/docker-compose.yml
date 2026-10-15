@@ -44,6 +44,9 @@ services:
       - NODE_ENV=production
       - TZ=${TZ:-America/Sao_Paulo}
       # ... the app's own settings (auth secret, public URL, API keys), each as KEY=${KEY}
+    labels:
+      # Shown on the Container Health page (resource map, guides)
+      - localinfra.url=${NEXT_PUBLIC_APP_URL:-}
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
       interval: 30s

@@ -257,7 +257,20 @@ not against theft, fire or a power surge. Add an off-site copy if the data matte
 
 This repo is also an umbrelOS community app store with one app, **Container Health**:
 a status page (the app's *Open* button, behind the Umbrel login) and three home-screen
-widgets:
+widgets.
+
+The status page refreshes every 15 seconds (only while it's visible) and shows:
+
+- **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the
+  Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
+  links. An app's public address shows under its name when it has the label
+  `localinfra.url=https://...` (the app template sets it from `NEXT_PUBLIC_APP_URL`).
+- **Projects**: every container with its status, resources and memory (used / limit), LocalInfra
+  included.
+- **Guides**: adding a Cloudflare tunnel route and a Google OAuth client, with the values for the
+  chosen app and your domain filled in.
+
+The widgets:
 
 - **Summary**: same style as the native Live Usage widget, with icons: containers
   healthy, projects healthy, issues
@@ -271,7 +284,8 @@ own. Hide a one-off container with the label `localinfra.health.hide=true`.
 It is one container: the stock `node:24-alpine` image running
 `localinfra-health/server.mjs.template`, non-root, read-only filesystem, no
 capabilities. It reads the Docker socket through the host's `docker` group (gid 987 on
-umbrelOS) and only ever calls `GET /containers/json`.
+umbrelOS) and only calls `GET /containers/json` and, while the status page is open,
+`GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings.
 
 ### Install (once, in the Umbrel UI)
 

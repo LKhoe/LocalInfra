@@ -91,7 +91,11 @@ OAuth/API keys. Local-dev values go to `.env.local`, not `.env`.
 
 ### 3. Public access (once, manual)
 
-- **Umbrel → Cloudflare Tunnel app**: add the public hostname, service `http://<app>:3000`.
+The Container Health page (Umbrel → Container Health → Open) has both as step-by-step guides,
+with the values for the app filled in and a copy button on each.
+
+- **Cloudflare Zero Trust → Networks → Tunnels** → the Umbrel tunnel → *Published application
+  routes*: add the public hostname, service `HTTP`, URL `<app>:3000`.
 - **OAuth providers** (Google, ...): add `https://<hostname>/api/auth/callback/<provider>` as a
   redirect URI.
 
