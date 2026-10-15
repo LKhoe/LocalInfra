@@ -6,14 +6,14 @@
 #
 # Overridable: PI_SSH (default umbrel@umbrel.local), DOCKER_SSH_HOST (default umbrel-docker: the
 #              ~/.ssh/config alias docker uses, never sharing connections), DOCKER_CONTEXT_NAME (default umbrel),
-#              YARG_DIR (default ../music/yarg-aggregator next to this repo)
+#              YARG_DIR (default ../yarg-aggregator next to this repo)
 set -euo pipefail
 
 PI_SSH="${PI_SSH:-umbrel@umbrel.local}"
 CTX="${DOCKER_CONTEXT_NAME:-umbrel}"
 DOCKER_SSH_HOST="${DOCKER_SSH_HOST:-umbrel-docker}"
 INFRA_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-YARG_DIR="${YARG_DIR:-$INFRA_DIR/../music/yarg-aggregator}"
+YARG_DIR="${YARG_DIR:-$INFRA_DIR/../yarg-aggregator}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 ok()   { printf '    \033[32m✔\033[0m %s\n' "$*"; }

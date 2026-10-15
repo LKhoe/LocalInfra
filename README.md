@@ -140,11 +140,11 @@ safe to re-run.
 2. Backup and S3 folders + markers on the external drive.
 3. Starts LocalInfra and waits for Postgres, Redis and S3 to be healthy.
 4. Provisions `yarg` (database, role, Redis user) and writes the credentials into
-   `../music/yarg-aggregator/.env` (the old file is kept as `.env.before-localinfra`).
+   `../yarg-aggregator/.env` (the old file is kept as `.env.before-localinfra`).
 5. Builds and starts yarg-aggregator on the Pi, waits for it to be healthy.
 6. Runs a first backup.
 
-It expects yarg-aggregator next to this repo (`../music/yarg-aggregator`, or set
+It expects yarg-aggregator next to this repo (`../yarg-aggregator`, or set
 `YARG_DIR=...`) with a `.env` already filled in (`BETTER_AUTH_SECRET`, URLs, OAuth keys;
 see that repo's `.env.example`).
 
