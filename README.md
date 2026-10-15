@@ -22,7 +22,10 @@ LocalInfra/
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
   backup/                       tiny image: pg_dump + busybox crond (backup.sh)
   scripts/bootstrap-pi.sh       first deploy from the Mac: LocalInfra + yarg, with checks
-  scripts/new-project.sh        provision a project (db role + redis user), print its env
+  scripts/new-project.sh        provision a project (db role + redis user + S3 key), print its env
+  scripts/provision-app.sh      new-project.sh + write the credentials into the app's .env
+  templates/app/                compose, deploy.sh, Dockerfile, health route to copy into an app
+  DEPLOYING-APPS.md             the standard way to deploy an app on the Pi (start here)
   scripts/check-health-app.sh   checks the Container Health app before a release
   umbrel-app-store.yml          makes this repo an umbrelOS community app store
   localinfra-health/            the "Container Health" umbrelOS app
@@ -143,6 +146,10 @@ Only containers whose definition changed are recreated; projects using LocalInfr
 running.
 
 ## 4. Add a project
+
+> **Deploying an app?** Follow [DEPLOYING-APPS.md](DEPLOYING-APPS.md): the app contract,
+> templates, and the step-by-step for every new app. `scripts/provision-app.sh` runs the
+> command below and writes its output into the app's `.env` for you.
 
 ```bash
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp              # postgres + redis
