@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot, run from the Mac: bring up LocalInfra on the Pi, provision yarg on it,
+# One-shot, run from the Mac: bring up LocalInfra (Postgres, Redis, S3) on the Pi, provision yarg on it,
 # point yarg's .env at LocalInfra and deploy yarg. Safe to re-run: each step checks first.
 #
 #   scripts/bootstrap-pi.sh
@@ -63,25 +63,34 @@ ok "docker context '$CTX' reaches the Pi ($(docker info --format '{{.Name}}'))"
 docker network inspect umbrel_main_network >/dev/null 2>&1 \
   || die "network umbrel_main_network not found on the Pi (yarg's compose joins it for the Cloudflare tunnel)."
 
-# ------------------------------------------------------------------ backup target
-step "Backup folder on the external drive"
-BACKUP_DIR=$(env_get "$INFRA_DIR/.env" BACKUP_DIR)
-[[ -n "$BACKUP_DIR" && "$BACKUP_DIR" != /path/on/the/pi* ]] || die "Set BACKUP_DIR in $INFRA_DIR/.env"
-src=$(ssh "$PI_SSH" "df -P '$(dirname "$BACKUP_DIR")' 2>/dev/null | awk 'NR==2{print \$1}'")
-[[ -n "$src" ]] || die "$(dirname "$BACKUP_DIR") does not exist on the Pi - is the drive mounted?"
-[[ "$src" != /dev/mmcblk* ]] || die "$(dirname "$BACKUP_DIR") is on the SD card ($src), not the external drive."
-if ! ssh "$PI_SSH" "test -f '$BACKUP_DIR/.localinfra-backup-target'"; then
-  ssh "$PI_SSH" "mkdir -p '$BACKUP_DIR' && touch '$BACKUP_DIR/.localinfra-backup-target'" 2>/dev/null \
-    || die "No permission to create it. On the Pi run:  sudo mkdir -p '$BACKUP_DIR' && sudo touch '$BACKUP_DIR/.localinfra-backup-target'"
-  ok "created $BACKUP_DIR (+ marker)"
-fi
-ok "$BACKUP_DIR on $src"
+# ------------------------------------------------------------------ drive folders
+# BACKUP_DIR and S3_DATA_DIR must be on the external drive, each with its marker file (if the
+# drive isn't mounted, Docker would silently create the folder on the SD card instead).
+ensure_drive_dir() { # env key, marker file name
+  local key=$1 marker=$2 dir src
+  dir=$(env_get "$INFRA_DIR/.env" "$key")
+  [[ -n "$dir" && "$dir" != /path/on/the/pi* ]] || die "Set $key in $INFRA_DIR/.env"
+  src=$(ssh "$PI_SSH" "df -P '$(dirname "$dir")' 2>/dev/null | awk 'NR==2{print \$1}'")
+  [[ -n "$src" ]] || die "$(dirname "$dir") does not exist on the Pi - is the drive mounted?"
+  [[ "$src" != /dev/mmcblk* ]] || die "$(dirname "$dir") is on the SD card ($src), not the external drive."
+  if ! ssh "$PI_SSH" "test -f '$dir/$marker'"; then
+    ssh "$PI_SSH" "mkdir -p '$dir' && touch '$dir/$marker'" 2>/dev/null \
+      || die "No permission to create it. On the Pi run:  sudo mkdir -p '$dir' && sudo touch '$dir/$marker'"
+    ok "created $dir (+ marker)"
+  fi
+  ok "$key=$dir on $src"
+}
+
+step "Backup and S3 folders on the external drive"
+ensure_drive_dir BACKUP_DIR .localinfra-backup-target
+ensure_drive_dir S3_DATA_DIR .localinfra-s3-target
 
 # ------------------------------------------------------------------ LocalInfra
 step "Starting LocalInfra on the Pi"
 (cd "$INFRA_DIR" && docker compose up -d --build)
 wait_healthy localinfra-postgres 120
 wait_healthy localinfra-redis 60
+wait_healthy localinfra-s3 60
 [[ "$(docker inspect -f '{{.State.Status}}' localinfra-backup)" == running ]] || die "localinfra-backup is not running"
 ok "localinfra-backup is running"
 

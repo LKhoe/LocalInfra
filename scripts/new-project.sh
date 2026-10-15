@@ -5,13 +5,16 @@
 #             CONNECT is revoked from PUBLIC, so other projects' roles can't even connect.
 #   Redis:    ACL user <name>, limited to keys and pub/sub channels "<name>:*",
 #             with admin commands and FLUSHALL/FLUSHDB blocked.
+#   S3:       (opt-in, --s3) Garage bucket <name with _ -> -> and access key <name>, allowed to
+#             read/write that bucket only: it can't see other buckets, create or delete buckets.
 #
 # Usage:
-#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis]
+#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis] [--s3]
 #
-#   --rotate       project already exists: issue new passwords (data is untouched)
-#   --no-postgres  only create the Redis user
-#   --no-redis     only create the Postgres role + database
+#   --rotate       project already exists: issue new passwords/keys (data is untouched)
+#   --no-postgres  skip the Postgres role + database
+#   --no-redis     skip the Redis user
+#   --s3           also create the S3 bucket + access key (Garage)
 #
 # Runs against whatever your docker CLI points at: on the Pi itself, or from the
 # Mac with  DOCKER_CONTEXT=umbrel scripts/new-project.sh <name>
@@ -21,8 +24,9 @@ cd "$(dirname "$0")/.."
 
 PG_CONTAINER=localinfra-postgres
 REDIS_CONTAINER=localinfra-redis
+S3_CONTAINER=localinfra-s3
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # Read KEY from .env without executing it (values may contain spaces, "*", ...)
 env_get() {
@@ -32,12 +36,13 @@ env_get() {
 
 gen_password() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-name=""; rotate=false; want_pg=true; want_redis=true
+name=""; rotate=false; want_pg=true; want_redis=true; want_s3=false
 for arg in "$@"; do
   case "$arg" in
     --rotate) rotate=true ;;
     --no-postgres) want_pg=false ;;
     --no-redis) want_redis=false ;;
+    --s3) want_s3=true ;;
     -h|--help) usage ;;
     -*) echo "Unknown option: $arg" >&2; usage ;;
     *) [[ -z "$name" ]] || usage; name="$arg" ;;
@@ -122,6 +127,42 @@ if $want_redis; then
   echo "Redis: user \"$name\" ready (keys/channels \"$name:*\")." >&2
 fi
 
+# ---------------------------------------------------------------- S3 (Garage)
+# Bucket names can't contain "_" (S3 naming rules); the key keeps the project name.
+S3_BUCKET=${name//_/-}
+s3_admin() {
+  # The CLI talks to the node over RPC; the container's own GARAGE_RPC_SECRET authenticates it.
+  docker exec -i "$S3_CONTAINER" garage "$@"
+}
+# Exact-name lookup: "garage key info <pattern>" also matches name/ID prefixes.
+s3_key_id() {
+  s3_admin key list | awk -v n="$1" 'NR > 1 && $3 == n { print $1 }'
+}
+if $want_s3; then
+  require_healthy "$S3_CONTAINER"
+  old_key_id=$(s3_key_id "$name")
+  if [[ -n "$old_key_id" && "$rotate" != true ]]; then
+    echo "S3 key \"$name\" already exists. Use --rotate to issue a new one." >&2
+    exit 1
+  fi
+
+  s3_admin bucket info "$S3_BUCKET" >/dev/null 2>&1 || s3_admin bucket create "$S3_BUCKET" >/dev/null
+  # Rotation = a new key pair; the bucket and its objects are untouched.
+  [[ -n "$old_key_id" ]] && s3_admin key delete --yes "$old_key_id" >/dev/null
+
+  created=$(s3_admin key create "$name")
+  S3_KEY_ID=$(awk -F': *' '/^Key ID:/ { print $2 }' <<<"$created")
+  S3_SECRET=$(awk -F': *' '/^Secret key:/ { print $2 }' <<<"$created")
+  if [[ ! "$S3_KEY_ID" =~ ^GK[0-9a-f]+$ || ! "$S3_SECRET" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Could not read the new S3 key from garage's output:" >&2
+    echo "$created" | grep -v '^Secret key' >&2
+    exit 1
+  fi
+  # read + write only: no --owner, so the key can't delete the bucket or change its settings
+  s3_admin bucket allow --read --write "$S3_BUCKET" --key "$S3_KEY_ID" >/dev/null
+  echo "S3: bucket \"$S3_BUCKET\" + key \"$name\" ($S3_KEY_ID) ready (read/write on that bucket only)." >&2
+fi
+
 # ---------------------------------------------------------------- Output
 echo >&2
 echo "# ---- add to the project's .env (on the machine that runs its compose) ----" >&2
@@ -141,8 +182,18 @@ REDIS_PASSWORD=$REDIS_PASSWORD
 REDIS_KEY_PREFIX=$name:
 EOF
 fi
+if $want_s3; then
+  cat <<EOF
+S3_ENDPOINT=http://$S3_CONTAINER:3900
+S3_REGION=garage
+S3_BUCKET=$S3_BUCKET
+S3_ACCESS_KEY_ID=$S3_KEY_ID
+S3_SECRET_ACCESS_KEY=$S3_SECRET
+EOF
+fi
 echo >&2
 nets=()
 $want_pg && nets+=("localinfra_postgres")
 $want_redis && nets+=("localinfra_redis")
+$want_s3 && nets+=("localinfra_s3")
 echo "# and join the external network(s): ${nets[*]}" >&2

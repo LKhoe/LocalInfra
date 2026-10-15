@@ -3,6 +3,7 @@
 #   postgres  → network "localinfra_postgres"  (one role + one database per project)
 #   redis     → network "localinfra_redis"     (one ACL user per project, keys "<project>:*")
 #   backup    → nightly pg_dump of every database to the external drive
+#   s3        → network "localinfra_s3"        (Garage; one bucket + one access key per project)
 #
 # Projects join only the network(s) they need, as external networks.
 # New project:   scripts/new-project.sh <name>
@@ -133,6 +134,41 @@ services:
           memory: 256M
     logging: *logging
 
+  s3:
+    container_name: localinfra-s3
+    build:
+      context: ./s3
+      args:
+        GARAGE_VERSION: ${GARAGE_VERSION:-v2.4.1}
+    image: localinfra-s3:${GARAGE_VERSION:-v2.4.1}
+    restart: unless-stopped
+    environment:
+      GARAGE_RPC_SECRET: ${S3_RPC_SECRET:?set S3_RPC_SECRET in .env}
+      GARAGE_ADMIN_TOKEN: ${S3_ADMIN_TOKEN:?set S3_ADMIN_TOKEN in .env}
+      TZ: ${TZ:-UTC}
+    volumes:
+      # Absolute path ON THE PI (on the external RAID drive). Must contain the marker file
+      # ".localinfra-s3-target", or the container refuses to start — see README.
+      - ${S3_DATA_DIR:?set S3_DATA_DIR in .env}:/data
+    ports:
+      # S3 API, loopback only by default: reach it from the Pi itself or via an SSH tunnel.
+      # The RPC (3901) and admin (3903) ports are never published.
+      - "${S3_PUBLISH:-127.0.0.1:3900}:3900"
+    networks:
+      - s3
+    healthcheck:
+      # /health answers 200 only once the single-node layout is up and the node can serve requests
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3903/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${S3_MEMORY_LIMIT:-256M}
+    logging: *logging
+
 volumes:
   postgres_data:
   redis_data:
@@ -142,3 +178,5 @@ networks:
     name: localinfra_postgres
   redis:
     name: localinfra_redis
+  s3:
+    name: localinfra_s3

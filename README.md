@@ -7,10 +7,11 @@ small umbrelOS app that shows whether your containers are healthy.
 |---|---|---|---|
 | PostgreSQL 17 | `localinfra-postgres` | `localinfra_postgres` | own role + own database; other roles can't even connect |
 | Redis 7.4 | `localinfra-redis` | `localinfra_redis` | own ACL user, limited to keys/channels `<project>:*` |
+| S3 (Garage 2.4) | `localinfra-s3` | `localinfra_s3` | own bucket + own access key; can't see, create or delete other buckets |
 | Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database to the external drive |
 | Container Health | `localinfra-health_server_1` | (umbrelOS app) | home-screen widgets, see [section 6](#6-container-health-widget-umbrelos) |
 
-Projects don't run their own Postgres or Redis. They join the network(s) they need as
+Projects don't run their own Postgres, Redis or file storage. They join the network(s) they need as
 **external** networks and use the credentials made by `scripts/new-project.sh`.
 
 ```
@@ -18,6 +19,7 @@ LocalInfra/
   compose.yml                   postgres + redis + backup
   .env.example                  copy to .env (secrets, backup path, schedule)
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
+  s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
   backup/                       tiny image: pg_dump + busybox crond (backup.sh)
   scripts/bootstrap-pi.sh       first deploy from the Mac: LocalInfra + yarg, with checks
   scripts/new-project.sh        provision a project (db role + redis user), print its env
@@ -78,12 +80,27 @@ the path is not on the SD card). To do it by hand:
 ssh umbrel@umbrel.local 'mkdir -p "<mountpoint>/localinfra-backups" && touch "<mountpoint>/localinfra-backups/.localinfra-backup-target"'
 ```
 
+### External drive for S3
+
+Garage keeps its metadata and objects in `S3_DATA_DIR` on the same RAID 1 drive, guarded by
+the same kind of marker file: without `.localinfra-s3-target` the container refuses to start
+instead of filling the SD card. `scripts/bootstrap-pi.sh` creates it; by hand:
+
+```bash
+ssh umbrel@umbrel.local 'mkdir -p "<mountpoint>/localinfra-s3" && touch "<mountpoint>/localinfra-s3/.localinfra-s3-target"'
+```
+
+The drive is **exFAT**, so Garage uses its SQLite metadata engine (LMDB, the default, needs
+sparse files). The objects are not backed up separately: they're on the RAID 1 drive, which
+covers a dead disk but not deletions or the Pi being lost.
+
 ### .env
 
 ```bash
 cp .env.example .env
-openssl rand -hex 32     # run twice: POSTGRES_SUPERUSER_PASSWORD and REDIS_ADMIN_PASSWORD
+openssl rand -hex 32     # one each: POSTGRES_SUPERUSER_PASSWORD, REDIS_ADMIN_PASSWORD, S3_RPC_SECRET, S3_ADMIN_TOKEN
 # set BACKUP_DIR=<mountpoint>/localinfra-backups   (a path ON THE PI)
+# set S3_DATA_DIR=<mountpoint>/localinfra-s3        (a path ON THE PI)
 ```
 
 With a Docker context, compose reads `.env` **on the Mac**, so this file is the only
@@ -96,8 +113,8 @@ safe to re-run.
 
 1. Preflight: SSH key login, 64-bit Pi, docker without sudo, the `umbrel` context
    (created if missing), the `umbrel_main_network` network.
-2. Backup folder + marker on the external drive.
-3. Starts LocalInfra and waits for Postgres and Redis to be healthy.
+2. Backup and S3 folders + markers on the external drive.
+3. Starts LocalInfra and waits for Postgres, Redis and S3 to be healthy.
 4. Provisions `yarg` (database, role, Redis user) and writes the credentials into
    `../music/yarg-aggregator/.env` (the old file is kept as `.env.before-localinfra`).
 5. Builds and starts yarg-aggregator on the Pi, waits for it to be healthy.
@@ -130,21 +147,29 @@ running.
 ```bash
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp              # postgres + redis
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-redis   # postgres only
+DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --s3         # postgres + redis + S3 bucket/key
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --rotate     # new passwords, data untouched
 ```
 
 The script prints the env block for the project (`DATABASE_URL`, `POSTGRES_HOST`,
-`REDIS_HOST`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_KEY_PREFIX`). Put it in the
+`REDIS_HOST`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_KEY_PREFIX`, and with `--s3`:
+`S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`). Put it in the
 project's `.env` and join the networks in its compose:
 
 ```yaml
 services:
   app:
-    networks: [localinfra_postgres, localinfra_redis]
+    networks: [localinfra_postgres, localinfra_redis]   # + localinfra_s3 with --s3
 networks:
   localinfra_postgres: { external: true }
   localinfra_redis:    { external: true }
 ```
+
+**S3 rule for apps:** use path-style requests (`forcePathStyle: true` in the AWS SDK) against
+`S3_ENDPOINT`, region `garage`. Bucket names use `-` where the project name has `_`
+(`my_recipes` → bucket `my-recipes`). The key can read and write objects in its bucket and
+nothing else; buckets are created only by `new-project.sh`. The S3 API is never published
+through the tunnel: apps serve their files themselves (behind their own login).
 
 To publish the app through the umbrelOS Cloudflare Tunnel app, also join
 `umbrel_main_network` (external) and point the tunnel's hostname at
@@ -158,6 +183,8 @@ gets `NOPERM`.
 Removing a project (irreversible):
 
 ```bash
+DOCKER_CONTEXT=umbrel docker exec localinfra-s3 garage key delete --yes <key id>        # garage key list
+DOCKER_CONTEXT=umbrel docker exec localinfra-s3 garage bucket delete --yes myapp         # must be empty
 DOCKER_CONTEXT=umbrel docker exec localinfra-postgres psql -U postgres -c 'DROP DATABASE myapp' -c 'DROP ROLE myapp'
 DOCKER_CONTEXT=umbrel docker exec -e REDISCLI_AUTH="$(sed -n 's/^REDIS_ADMIN_PASSWORD=//p' .env)" localinfra-redis \
   sh -c 'redis-cli --no-auth-warning ACL DELUSER myapp && redis-cli --no-auth-warning ACL SAVE'
@@ -249,18 +276,20 @@ Run the same stack on Docker Desktop. The shell variable overrides `BACKUP_DIR` 
 
 ```bash
 mkdir -p backups-local && touch backups-local/.localinfra-backup-target    # git-ignored
-BACKUP_DIR=./backups-local DOCKER_CONTEXT=desktop-linux docker compose up -d --build
+mkdir -p s3-local && touch s3-local/.localinfra-s3-target                  # git-ignored
+BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local DOCKER_CONTEXT=desktop-linux docker compose up -d --build
 DOCKER_CONTEXT=desktop-linux scripts/new-project.sh yarg
 ```
 
-Postgres and Redis then listen on `127.0.0.1:5432` and `127.0.0.1:6379`. The printed
+Postgres, Redis and S3 then listen on `127.0.0.1:5432`, `127.0.0.1:6379` and
+`127.0.0.1:3900`. The printed
 env uses the container names as hosts (`localinfra-postgres`, `localinfra-redis`); an
 app running directly on the Mac (`npm run dev`) uses `localhost` instead.
 
 To reach the **Pi's** databases from the Mac (TablePlus, Drizzle Studio, ...):
 
 ```bash
-ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 umbrel@umbrel.local
+ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 umbrel@umbrel.local
 ```
 
 ## Notes
@@ -272,5 +301,8 @@ ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 umbrel@umbrel.local
 - **What's isolated, and what isn't:** credentials and permissions separate the
   projects. Projects on the same network can still reach each other's containers, so
   don't run admin UIs without auth on these networks.
-- **Ports:** Postgres and Redis are published on the Pi's loopback only
-  (`POSTGRES_PUBLISH` / `REDIS_PUBLISH`); use the SSH tunnel above to reach them.
+- **Ports:** Postgres, Redis and the S3 API are published on the Pi's loopback only
+  (`POSTGRES_PUBLISH` / `REDIS_PUBLISH` / `S3_PUBLISH`); use the SSH tunnel above to reach
+  them. Garage's RPC and admin ports are never published.
+- **Upgrading Garage:** bump `GARAGE_VERSION`, then `DOCKER_CONTEXT=umbrel docker compose up -d --build s3`.
+  Read the release notes first for major versions.

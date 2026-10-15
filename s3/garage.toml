@@ -1,0 +1,28 @@
+# Garage (S3-compatible object storage), single node.
+# Secrets are NOT here: rpc_secret and admin_token come from GARAGE_RPC_SECRET and
+# GARAGE_ADMIN_TOKEN (compose passes them from .env).
+
+# Both live on the external RAID drive (/data is S3_DATA_DIR on the Pi), so losing the SD
+# card loses nothing. Without the metadata the blocks are unreadable, so they stay together.
+metadata_dir = "/data/meta"
+data_dir = "/data/blocks"
+
+# The drive is exFAT: no sparse files, which LMDB (Garage's default) depends on.
+db_engine = "sqlite"
+# Two most recent copies of the metadata DB, in case it gets corrupted (power cut, ...)
+metadata_auto_snapshot_interval = "6h"
+
+replication_factor = 1
+
+# Photos and other app files are already compressed; zstd would only cost the Pi CPU.
+compression_level = "none"
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+
+[admin]
+api_bind_addr = "[::]:3903"
