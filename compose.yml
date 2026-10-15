@@ -4,6 +4,7 @@
 #   redis     → network "localinfra_redis"     (one ACL user per project, keys "<project>:*")
 #   backup    → nightly pg_dump of every database to the external drive
 #   s3        → network "localinfra_s3"        (Garage; one bucket + one access key per project)
+#   tunnel    → network "localinfra_tunnel"    (Cloudflare tunnel; reaches public apps by container name)
 #
 # Projects join only the network(s) they need, as external networks.
 # New project:   scripts/new-project.sh <name>
@@ -169,6 +170,31 @@ services:
           memory: ${S3_MEMORY_LIMIT:-256M}
     logging: *logging
 
+  tunnel:
+    container_name: localinfra-tunnel
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.9.3}
+    restart: unless-stopped
+    # Routes (hostname → http://<container>:<port>) live in Cloudflare Zero Trust, not here.
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Read by cloudflared from the environment, so it doesn't show in the command line
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
+      TUNNEL_METRICS: 127.0.0.1:20241
+    networks:
+      - tunnel
+    healthcheck:
+      # The image has no shell: cloudflared asks its own /ready endpoint (200 once a connection is up)
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:20241", "ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${TUNNEL_MEMORY_LIMIT:-128M}
+    logging: *logging
+
 volumes:
   postgres_data:
   redis_data:
@@ -180,3 +206,5 @@ networks:
     name: localinfra_redis
   s3:
     name: localinfra_s3
+  tunnel:
+    name: localinfra_tunnel

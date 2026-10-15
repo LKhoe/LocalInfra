@@ -58,8 +58,8 @@ services:
       - localinfra_postgres
       - localinfra_redis
       - localinfra_s3
-      # Public access through the umbrelOS Cloudflare Tunnel app: http://myapp:3000
-      - umbrel_main_network
+      # Public access through LocalInfra's Cloudflare tunnel: http://myapp:3000
+      - localinfra_tunnel
     deploy:
       resources:
         limits:
@@ -78,5 +78,5 @@ networks:
     external: true
   localinfra_s3:
     external: true
-  umbrel_main_network:
+  localinfra_tunnel:
     external: true

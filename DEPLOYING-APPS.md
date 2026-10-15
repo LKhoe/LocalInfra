@@ -10,7 +10,7 @@ app. Reference implementation: **my-recipes**.
                                               ├─ localinfra_postgres → db + role <app_name>
                                               ├─ localinfra_redis    → ACL user, keys "<app_name>:*"
                                               ├─ localinfra_s3       → bucket <app-name> + key
-                                              └─ umbrel_main_network → Cloudflare tunnel → https://<app>.<domain>
+                                              └─ localinfra_tunnel   → Cloudflare tunnel → https://<app>.<domain>
 ```
 
 Nothing is cloned or copied to the Pi by hand. LocalInfra backs up every database nightly and
@@ -28,7 +28,7 @@ What every app needs before it can be deployed. The templates in
 | 1 | `docker-compose.yml` has **one service**; `container_name`, service name and image name are the app name (kebab-case), image tag `:latest` | `deploy.sh` reads everything from compose and keeps `<app>:previous` for rollback |
 | 2 | **No database, Redis or file volume of its own**: data goes to LocalInfra Postgres / Redis / S3 | one place to run, back up and monitor |
 | 3 | **No bind mounts** (`./file:/path`) | compose runs on the Mac, the paths would be looked up on the Pi |
-| 4 | Joins LocalInfra's networks as **external** networks, plus `umbrel_main_network` if public | the tunnel and the shared services are reachable by container name |
+| 4 | Joins LocalInfra's networks as **external** networks, plus `localinfra_tunnel` if public | the tunnel and the shared services are reachable by container name |
 | 5 | A **healthcheck** on `GET /api/health` that checks the app's dependencies (DB, bucket, ...) | `deploy.sh` waits for it; the widget turns red when it fails |
 | 6 | A **unique host port** from the table below, container port 3000 | LAN access; two apps can't share a port |
 | 7 | A **memory limit** (512M default) and json-file log rotation | the Pi also runs umbrelOS and its apps |
@@ -94,7 +94,7 @@ OAuth/API keys. Local-dev values go to `.env.local`, not `.env`.
 The Container Health page (Umbrel → Container Health → Open) has both as step-by-step guides,
 with the values for the app filled in and a copy button on each.
 
-- **Cloudflare Zero Trust → Networks → Tunnels** → the Umbrel tunnel → *Published application
+- **Cloudflare Zero Trust → Networks → Tunnels** → the LocalInfra tunnel (`localinfra-tunnel`) → *Published application
   routes*: add the public hostname, service `HTTP`, URL `<app>:3000`.
 - **OAuth providers** (Google, ...): add `https://<hostname>/api/auth/callback/<provider>` as a
   redirect URI.
@@ -183,7 +183,6 @@ Never run `provision-app.sh` against Docker Desktop for an app whose `.env` hold
 | Symptom | Fix |
 |---|---|
 | `Network localinfra_… not found` | LocalInfra isn't running on that context, or the app joins a network it wasn't provisioned for |
-| `network umbrel_main_network … could not be found` | start any umbrelOS app once (the Cloudflare Tunnel app creates it) |
 | `Bind for 0.0.0.0:<port> failed` | port taken: pick the next free one from the table |
 | `password authentication failed` / S3 `403` / Redis `NOPERM` | `.env` doesn't match LocalInfra: rotate (above) |
 | `Error loading shared library libvips-cpp.so…` | rule 9: install runtime deps with `npm ci --omit=dev` |

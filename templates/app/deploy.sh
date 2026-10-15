@@ -88,12 +88,12 @@ case "${1:-}" in
 esac
 
 # ---------------------------------------------------------------- pre-flight
-# External networks (LocalInfra's, umbrel_main_network) must already exist on the target —
+# External networks (LocalInfra's) must already exist on the target —
 # checked before the build, which takes minutes on the Pi.
 while read -r net; do
   [[ -z "$net" ]] && continue
   docker network inspect "$net" >/dev/null 2>&1 \
-    || die "Network $net not found on '${DOCKER_CONTEXT}'. Start LocalInfra (or the umbrelOS app that creates it) first."
+    || die "Network $net not found on '${DOCKER_CONTEXT}'. Start LocalInfra first."
 done < <(jq -r '.networks // {} | to_entries[] | select(.value.external == true) | .value.name // .key' <<<"$config")
 
 # .env is the Pi's config; local-dev values belong in .env.local

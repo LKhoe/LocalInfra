@@ -40,8 +40,8 @@ const RESOURCES = [
   { key: "postgres", label: "Postgres", short: "PG", network: "localinfra_postgres", provider: "localinfra-postgres" },
   { key: "redis", label: "Redis", short: "RD", network: "localinfra_redis", provider: "localinfra-redis" },
   { key: "s3", label: "S3", short: "S3", network: "localinfra_s3", provider: "localinfra-s3" },
-  // Every app on this network can be reached by the umbrelOS Cloudflare Tunnel app
-  { key: "tunnel", label: "Tunnel", short: "CF", network: "umbrel_main_network", provider: null },
+  // Every app on this network can be reached by the Cloudflare tunnel
+  { key: "tunnel", label: "Tunnel", short: "CF", network: "localinfra_tunnel", provider: "localinfra-tunnel" },
 ];
 
 function dockerGet(path) {
@@ -113,11 +113,6 @@ function describe(c) {
 async function snapshot() {
   const list = await dockerGet("/containers/json?all=true");
   const containers = list.filter(isMine).map(describe);
-  // The tunnel is an umbrelOS app (not "mine"), found by its image. The umbrelOS
-  // Cloudflare Tunnel app runs a web UI and a connector: the connector is the tunnel.
-  const tunnels = list.filter((c) => /cloudflared/.test(c.Image || ""));
-  const cloudflared = tunnels.find((c) => /connector/.test(c.Image + " " + (c.Names?.[0] || ""))) || tunnels[0];
-  const tunnel = cloudflared ? describe(cloudflared) : null;
 
   // One group per compose project; containers outside compose stand alone
   const groups = new Map();
@@ -139,7 +134,7 @@ async function snapshot() {
   const counts = { ok: 0, starting: 0, unhealthy: 0, stopped: 0 };
   for (const c of containers) counts[c.state]++;
 
-  return { projects, containers, counts, tunnel };
+  return { projects, containers, counts };
 }
 
 // ---------------------------------------------------------------- memory
@@ -540,7 +535,7 @@ function resourceMap(snap, mem) {
     .join("");
 
   const right = RESOURCES.map((r) => {
-    const provider = r.provider ? byName.get(r.provider) : snap.tunnel;
+    const provider = byName.get(r.provider);
     const users = apps.filter((c) => c.uses.includes(r.key)).length;
     const reading = provider && mem.get(provider.id);
     const sub = users + (users === 1 ? " app" : " apps") + (reading ? " · " + bytes(reading.used) : "");
@@ -590,7 +585,7 @@ function projectCard(p, mem) {
 async function livePart() {
   try {
     const snap = await snapshot();
-    const mem = await memoryFor([...snap.containers, snap.tunnel]);
+    const mem = await memoryFor(snap.containers);
     return {
       snap,
       html:
@@ -640,9 +635,9 @@ function guides(snap) {
     '<div class="gbody">' +
     '<a class="btn" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Cloudflare Zero Trust</a>" +
     '<ol class="steps">' +
-    '<li class="warn" data-if="notunnel" hidden>This container is not on ' + chip(null, "umbrel_main_network") +
+    '<li class="warn" data-if="notunnel" hidden>This container is not on ' + chip(null, "localinfra_tunnel") +
     ', so the tunnel can\'t reach it. Add it to the networks in the app\'s compose file and run <kbd>./deploy.sh</kbd>.</li>' +
-    "<li>In Zero Trust go to <b>Networks → Tunnels</b> and open the tunnel of the Umbrel Cloudflare Tunnel app.</li>" +
+    "<li>In Zero Trust go to <b>Networks → Tunnels</b> and open the LocalInfra tunnel (the one <kbd>localinfra-tunnel</kbd> runs).</li>" +
     "<li>Open the <b>Published application routes</b> tab and click <b>Add a published application route</b>.</li>" +
     "<li>Subdomain " + chip("sub", "myapp") + " Domain " + chip("domain", "example.com") +
     '<span class="note">Leave Path empty.</span></li>' +

@@ -9,6 +9,7 @@ small umbrelOS app that shows whether your containers are healthy.
 | Redis 7.4 | `localinfra-redis` | `localinfra_redis` | own ACL user, limited to keys/channels `<project>:*` |
 | S3 (Garage 2.4) | `localinfra-s3` | `localinfra_s3` | own bucket + own access key; can't see, create or delete other buckets |
 | Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database to the external drive |
+| Cloudflare tunnel | `localinfra-tunnel` | `localinfra_tunnel` | reaches only the apps that join `localinfra_tunnel` |
 | Container Health | `localinfra-health_server_1` | (umbrelOS app) | home-screen widgets, see [section 6](#6-container-health-widget-umbrelos) |
 
 Projects don't run their own Postgres, Redis or file storage. They join the network(s) they need as
@@ -16,7 +17,7 @@ Projects don't run their own Postgres, Redis or file storage. They join the netw
 
 ```
 LocalInfra/
-  compose.yml                   postgres + redis + backup
+  compose.yml                   postgres + redis + s3 + backup + tunnel
   .env.example                  copy to .env (secrets, backup path, schedule)
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
@@ -123,6 +124,7 @@ covers a dead disk but not deletions or the Pi being lost.
 ```bash
 cp .env.example .env
 openssl rand -hex 32     # one each: POSTGRES_SUPERUSER_PASSWORD, REDIS_ADMIN_PASSWORD, S3_RPC_SECRET, S3_ADMIN_TOKEN
+# set CLOUDFLARE_TUNNEL_TOKEN=<token from Zero Trust → Networks → Tunnels → the tunnel>
 # set BACKUP_DIR=<mountpoint>/localinfra-backups   (a path ON THE PI)
 # set S3_DATA_DIR=<mountpoint>/localinfra-s3        (a path ON THE PI)
 ```
@@ -136,7 +138,7 @@ place these secrets live. It is git-ignored; keep a copy in your password manage
 safe to re-run.
 
 1. Preflight: SSH key login, 64-bit Pi, docker without sudo, the `umbrel` context
-   (created if missing), the `umbrel_main_network` network.
+   (created if missing).
 2. Backup and S3 folders + markers on the external drive.
 3. Starts LocalInfra and waits for Postgres, Redis and S3 to be healthy.
 4. Provisions `yarg` (database, role, Redis user) and writes the credentials into
@@ -199,9 +201,10 @@ networks:
 nothing else; buckets are created only by `new-project.sh`. The S3 API is never published
 through the tunnel: apps serve their files themselves (behind their own login).
 
-To publish the app through the umbrelOS Cloudflare Tunnel app, also join
-`umbrel_main_network` (external) and point the tunnel's hostname at
-`http://<container_name>:<port>`.
+To publish the app through LocalInfra's Cloudflare tunnel, also join
+`localinfra_tunnel` (external) and point the tunnel's hostname at
+`http://<container_name>:<port>`. The routes live in Cloudflare Zero Trust (Networks →
+Tunnels), not in this repo; `localinfra-tunnel` only needs `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
 
 **Redis rule for apps:** every key and pub/sub channel must start with
 `REDIS_KEY_PREFIX` (ioredis `keyPrefix` for normal clients; BullMQ `prefix: "<project>:bull"`

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot, run from the Mac: bring up LocalInfra (Postgres, Redis, S3) on the Pi, provision yarg on it,
+# One-shot, run from the Mac: bring up LocalInfra (Postgres, Redis, S3, tunnel) on the Pi, provision yarg on it,
 # point yarg's .env at LocalInfra and deploy yarg. Safe to re-run: each step checks first.
 #
 #   scripts/bootstrap-pi.sh
@@ -74,8 +74,6 @@ export DOCKER_CONTEXT="$CTX"
   || die "docker context '$CTX' does not reach the Pi. Check: docker context inspect $CTX"
 ok "docker context '$CTX' reaches the Pi ($(docker info --format '{{.Name}}'))"
 
-docker network inspect umbrel_main_network >/dev/null 2>&1 \
-  || die "network umbrel_main_network not found on the Pi (yarg's compose joins it for the Cloudflare tunnel)."
 
 # ------------------------------------------------------------------ drive folders
 # BACKUP_DIR and S3_DATA_DIR must be on the external drive, each with its marker file (if the
@@ -105,6 +103,7 @@ step "Starting LocalInfra on the Pi"
 wait_healthy localinfra-postgres 120
 wait_healthy localinfra-redis 60
 wait_healthy localinfra-s3 60
+wait_healthy localinfra-tunnel 60
 [[ "$(docker inspect -f '{{.State.Status}}' localinfra-backup)" == running ]] || die "localinfra-backup is not running"
 ok "localinfra-backup is running"
 
@@ -154,8 +153,6 @@ docker exec localinfra-backup backup.sh || die "backup failed - see the output a
 
 # ------------------------------------------------------------------ summary
 step "Done"
-nets=$(docker inspect cloudflared_connector_1 --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null || true)
-echo "    Cloudflare connector networks: ${nets:-<connector not found>}"
 cat <<EOF
 
     Containers:  docker --context $CTX ps
