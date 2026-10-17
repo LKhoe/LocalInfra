@@ -266,7 +266,7 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
 
 - **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the
   Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
-  links. An app's public address shows under its name when it has the label
+  links. An app's public address shows under its name, as a link, when it has the label
   `localinfra.url=https://...` (the app template sets it from `NEXT_PUBLIC_APP_URL`).
 - **Projects**: every container with its status, resources and memory (used / limit), LocalInfra
   included.

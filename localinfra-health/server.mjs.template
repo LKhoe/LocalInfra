@@ -290,6 +290,24 @@ const hostname = (url) => {
   }
 };
 
+// Only http(s) addresses become links (the label is free text)
+const publicUrl = (url) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+  } catch {
+    return null;
+  }
+};
+
+const appLink = (c, cls) => {
+  const href = c.url && publicUrl(c.url);
+  return href
+    ? '<a class="' + cls + '" href="' + escape(href) + '" target="_blank" rel="noopener noreferrer" title="Open ' + escape(href) + '">' +
+        "<span>" + escape(hostname(href)) + "</span>" + icon("out") + "</a>"
+    : "";
+};
+
 // Stroke icons in the Tabler style umbrelOS uses
 const ICONS = {
   postgres: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6M4.5 12v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-6"/>',
@@ -383,6 +401,9 @@ const STYLE = [
   ".pill .t { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }",
   ".pill b { font-weight: 500; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
   ".pill small { color: var(--muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".url { display: inline-flex; align-items: center; gap: 4px; min-width: 0; color: var(--neon); font: 11.5px var(--mono); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
+  ".url span { overflow: hidden; text-overflow: ellipsis; } .url .ic { width: 12px; height: 12px; opacity: .8; } .url:hover, .url:focus-visible { text-decoration: underline; outline: none; }",
+  ".pill .url { font-size: 11px; cursor: pointer; }",
   ".res { height: 54px; padding: 0 14px 0 9px; border-radius: 16px; border-color: color-mix(in srgb, var(--c) 32%, transparent);",
   "  background: linear-gradient(90deg, color-mix(in srgb, var(--c) 9%, transparent), rgba(255,255,255,.02)); box-shadow: 0 0 26px -12px var(--c); }",
   ".res .ico { width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center; flex: none; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }",
@@ -406,6 +427,7 @@ const STYLE = [
   ".rows { list-style: none; margin: 0; padding: 0; }",
   ".row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto 150px; gap: 6px 14px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line); }",
   ".who { min-width: 0; } .who b { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
+  ".nm { display: flex; align-items: baseline; gap: 10px; min-width: 0; } .nm b { flex: none; max-width: 60%; }",
   ".who small { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
   ".row.st-unhealthy .who small, .row.st-stopped .who small { color: var(--bad); }",
   ".chips { display: flex; gap: 5px; flex-wrap: wrap; }",
@@ -460,6 +482,7 @@ const STYLE = [
   "  .map { padding: 14px 10px; grid-template-columns: minmax(0, 1.25fr) minmax(24px, .45fr) minmax(0, 1fr); }",
   "  .pill { padding: 0 11px; gap: 8px; } .res { padding: 0 10px 0 7px; } .res .ico { width: 28px; height: 28px; } .res .dot { display: none; }",
   "  .row { grid-template-columns: 8px minmax(0, 1fr) 112px; } .row .chips { grid-column: 2; grid-row: 2; } .row .mem { grid-column: 3; grid-row: 1 / span 2; }",
+  "  .nm { flex-direction: column; align-items: flex-start; gap: 1px; } .nm b { max-width: 100%; }",
   "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
   "  .mem em { display: none; } .steps li { line-height: 1.7; }",
   "}",
@@ -525,11 +548,11 @@ function resourceMap(snap, mem) {
 
   const left = apps
     .map((c) => {
-      const host = c.url && hostname(c.url);
-      const sub = host || (c.project && c.project !== c.name ? c.project : "");
+      const link = appLink(c, "url");
+      const sub = c.project && c.project !== c.name ? c.project : "";
       return (
         '<div class="pill" data-app="' + escape(c.name) + '" title="' + escape(c.name + " · " + c.status) + '"><span class="dot st-' + c.state + '"></span>' +
-        '<span class="t"><b>' + escape(c.name) + "</b>" + (sub ? "<small>" + escape(sub) + "</small>" : "") + "</span></div>"
+        '<span class="t"><b>' + escape(c.name) + "</b>" + (link || (sub ? "<small>" + escape(sub) + "</small>" : "")) + "</span></div>"
       );
     })
     .join("");
@@ -565,7 +588,7 @@ function containerRow(c, mem) {
     .join("");
   return (
     '<li class="row st-' + c.state + '"><span class="dot"></span>' +
-    '<div class="who"><b>' + escape(c.name) + "</b><small>" + escape(c.status) + "</small></div>" +
+    '<div class="who"><span class="nm"><b>' + escape(c.name) + "</b>" + appLink(c, "url") + "</span><small>" + escape(c.status) + "</small></div>" +
     '<div class="chips">' + chips + "</div>" + memoryCell(mem.get(c.id)) + "</li>"
   );
 }
