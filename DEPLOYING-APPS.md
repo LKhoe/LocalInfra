@@ -43,7 +43,9 @@ What every app needs before it can be deployed. The templates in
 |---|---|
 | 3000 | yarg-aggregator |
 | 3001 | my-recipes |
-| 3002 | *next free* |
+| 3002 | sports-cal |
+| 3003 | brain-gym |
+| 3004 | *next free* |
 
 Add the app here when you pick its port.
 
