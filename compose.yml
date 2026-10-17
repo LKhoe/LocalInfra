@@ -2,7 +2,7 @@
 #
 #   postgres  → network "localinfra_postgres"  (one role + one database per project)
 #   redis     → network "localinfra_redis"     (one ACL user per project, keys "<project>:*")
-#   backup    → nightly pg_dump of every database to the external drive
+#   backup    → nightly pg_dump of every database + copy of Home Assistant's backup to the external drive
 #   s3        → network "localinfra_s3"        (Garage; one bucket + one access key per project)
 #   tunnel    → network "localinfra_tunnel"    (Cloudflare tunnel; reaches public apps by container name)
 #
@@ -115,16 +115,27 @@ services:
       BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
       BACKUP_KEEP_MONTHS: ${BACKUP_KEEP_MONTHS:-6}
       BACKUP_ON_START: ${BACKUP_ON_START:-false}
+      HA_BACKUP_MAX_AGE_HOURS: ${HA_BACKUP_MAX_AGE_HOURS:-26}
     volumes:
       # Absolute path ON THE PI (on the external drive). Must contain the marker
       # file ".localinfra-backup-target" — see README.
       - ${BACKUP_DIR:?set BACKUP_DIR in .env}:/backups
+      # Home Assistant's own backups folder (it makes an encrypted .tar daily at 03:30).
+      # Read-only, so LocalInfra can never change or delete Home Assistant's backups.
+      - ${HA_BACKUP_SOURCE:-/home/umbrel/umbrel/app-data/home-assistant/data/backups}:/homeassistant:ro
     networks:
       - postgres
-    # Unhealthy when no backup succeeded in the last 26h (or ever), so a missed
-    # backup shows up in Container Health like any other broken container.
+    # Unhealthy when no Postgres backup succeeded in the last 26h (or ever), so a missed
+    # backup shows up in Container Health like any other broken container. Same for the
+    # Home Assistant copy, except during the first 26h after the container starts
+    # (/run/backup.env is written at start), so a fresh deploy isn't flagged before
+    # its first nightly run.
     healthcheck:
-      test: ["CMD-SHELL", "find /backups/postgres/last_success -mmin -1560 2>/dev/null | grep -q ."]
+      test:
+        - CMD-SHELL
+        - >-
+          find /backups/postgres/last_success -mmin -1560 2>/dev/null | grep -q . &&
+          find /backups/homeassistant/last_success /run/backup.env -mmin -1560 2>/dev/null | grep -q .
       interval: 5m
       timeout: 10s
       retries: 1

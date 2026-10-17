@@ -7,7 +7,8 @@ RUN apk add --no-cache tzdata
 
 COPY entrypoint.sh /usr/local/bin/backup-entrypoint
 COPY backup.sh /usr/local/bin/backup.sh
-RUN chmod 755 /usr/local/bin/backup-entrypoint /usr/local/bin/backup.sh
+COPY backup-homeassistant.sh /usr/local/bin/backup-homeassistant.sh
+RUN chmod 755 /usr/local/bin/backup-entrypoint /usr/local/bin/backup.sh /usr/local/bin/backup-homeassistant.sh
 
 ENTRYPOINT ["backup-entrypoint"]
 CMD []

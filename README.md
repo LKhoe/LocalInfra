@@ -8,7 +8,7 @@ small umbrelOS app that shows whether your containers are healthy.
 | PostgreSQL 17 | `localinfra-postgres` | `localinfra_postgres` | own role + own database; other roles can't even connect |
 | Redis 7.4 | `localinfra-redis` | `localinfra_redis` | own ACL user, limited to keys/channels `<project>:*` |
 | S3 (Garage 2.4) | `localinfra-s3` | `localinfra_s3` | own bucket + own access key; can't see, create or delete other buckets |
-| Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database to the external drive |
+| Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database + copy of Home Assistant's backup to the external drive |
 | Cloudflare tunnel | `localinfra-tunnel` | `localinfra_tunnel` | reaches only the apps that join `localinfra_tunnel` |
 | Container Health | `localinfra-health_server_1` | (umbrelOS app) | home-screen widgets, see [section 6](#6-container-health-widget-umbrelos) |
 
@@ -21,7 +21,7 @@ LocalInfra/
   .env.example                  copy to .env (secrets, backup path, schedule)
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
-  backup/                       tiny image: pg_dump + busybox crond (backup.sh)
+  backup/                       tiny image: pg_dump + busybox crond (backup.sh, backup-homeassistant.sh)
   scripts/bootstrap-pi.sh       first deploy from the Mac: LocalInfra + yarg, with checks
   scripts/new-project.sh        provision a project (db role + redis user + S3 key), print its env
   scripts/provision-app.sh      new-project.sh + write the credentials into the app's .env
@@ -232,26 +232,45 @@ DOCKER_CONTEXT=umbrel docker exec -i localinfra-postgres pg_restore -U myapp -d 
 
 ## 5. Backups
 
-Every night at `BACKUP_CRON` (local time, `TZ`), the backup writes:
+Every night at `BACKUP_CRON` (local time, `TZ`), the backup dumps Postgres, then copies
+the newest Home Assistant backup (each step runs even if the other fails):
 
 ```
 <BACKUP_DIR>/postgres/
   daily/2026-10-14_0400/   globals.sql (roles) + <db>.dump per database   kept BACKUP_KEEP_DAYS
   monthly/...              copy of the backup from the 1st of each month  kept BACKUP_KEEP_MONTHS
   last_success             timestamp of the last good run
+<BACKUP_DIR>/homeassistant/
+  daily/2026-10-18_0400/   Automatic_backup_<version>_<date>.tar           same retention
+  monthly/...
+  last_success
 ```
 
 `localinfra-backup` turns **unhealthy** when no backup succeeded in the last 26 hours,
-so a missed backup shows up in `docker ps` and in the Container Health widget.
+so a missed backup shows up in `docker ps` and in the Container Health widget. (For Home
+Assistant, only once the container has been up 26 hours, so a fresh deploy isn't flagged.)
 
 ```bash
 DOCKER_CONTEXT=umbrel docker exec localinfra-backup backup.sh                 # run now
+DOCKER_CONTEXT=umbrel docker exec localinfra-backup backup-homeassistant.sh   # copy HA's newest backup now
 DOCKER_CONTEXT=umbrel docker logs localinfra-backup                           # history
 DOCKER_CONTEXT=umbrel docker exec localinfra-backup ls /backups/postgres/daily
 # restore one database from a backup (replaces its contents)
 DOCKER_CONTEXT=umbrel docker exec localinfra-backup \
   pg_restore --clean --if-exists -d myapp /backups/postgres/daily/<stamp>/myapp.dump
 ```
+
+### Home Assistant
+
+Home Assistant (the umbrelOS app) makes its own **encrypted** backup daily at 03:30 and keeps 3
+copies in its backups folder (Settings → System → Backups). LocalInfra mounts that folder
+read-only (`HA_BACKUP_SOURCE`) and copies the newest `.tar` to the external drive. The copy
+fails, and says so in the log, when there is no backup or the newest one is older than
+`HA_BACKUP_MAX_AGE_HOURS` (26), meaning Home Assistant stopped backing up.
+
+To restore, upload the `.tar` in Home Assistant (Settings → System → Backups → Upload
+backup), or pick it during the onboarding of a fresh install, and enter the backup
+encryption key. Keep that key in your password manager: without it the backups are useless.
 
 A copy on a drive plugged into the same Pi protects against mistakes and SD death, but
 not against theft, fire or a power surge. Add an off-site copy if the data matters.
@@ -319,13 +338,15 @@ the app folder is only copied on a fresh install.
 
 ## 7. Local development on the Mac
 
-Run the same stack on Docker Desktop. The shell variable overrides `BACKUP_DIR` from
+Run the same stack on Docker Desktop. The shell variables override the paths from
 `.env`, so the Pi settings stay untouched:
 
 ```bash
 mkdir -p backups-local && touch backups-local/.localinfra-backup-target    # git-ignored
 mkdir -p s3-local && touch s3-local/.localinfra-s3-target                  # git-ignored
-BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local DOCKER_CONTEXT=desktop-linux docker compose up -d --build
+mkdir -p ha-backups-local                                                   # git-ignored
+BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local HA_BACKUP_SOURCE=./ha-backups-local \
+  DOCKER_CONTEXT=desktop-linux docker compose up -d --build
 DOCKER_CONTEXT=desktop-linux scripts/new-project.sh yarg
 ```
 
