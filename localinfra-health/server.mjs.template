@@ -3,6 +3,7 @@
 //
 // Read-only by design: the only Docker API calls are GET /containers/json and, for
 // the status page only, GET /containers/<id>/stats (one-shot memory reading).
+// The status page also shows each app's icon, fetched from its public address.
 // No dependencies; runs on a stock node:alpine image.
 //
 // This is a ".template" because umbrelOS app updates only copy whitelisted
@@ -27,6 +28,10 @@ const URL_LABEL = "localinfra.url";
 const REFRESH = process.env.WIDGET_REFRESH || "30s";
 // Memory readings are shared by every open status page for this long
 const MEMORY_TTL_MS = 10000;
+// App icons (fetched from each app's public address) are kept this long
+const SITE_ICON_TTL_MS = 12 * 3600 * 1000;
+const SITE_ICON_RETRY_MS = 10 * 60 * 1000;
+const SITE_ICON_MAX_BYTES = 256 * 1024;
 
 const STATES = {
   ok: { rank: 0, emoji: "✅", label: "Healthy" },
@@ -179,6 +184,110 @@ async function memoryFor(targets) {
   return memoryCache.pending;
 }
 
+// ---------------------------------------------------------------- app icons
+// The resource map shows each app's own icon. Apps declare it in different places
+// (<link rel="icon"> with an .svg, a .png, a 1024px .ico...), so the server reads the
+// app's page once, picks the best one, and keeps it in memory. Only addresses from the
+// localinfra.url label are ever fetched.
+
+const GLOBE =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">' +
+  '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.6 3.5 5.4 3.5 8.5s-1.1 5.9-3.5 8.5c-2.4-2.6-3.5-5.4-3.5-8.5S9.6 6.1 12 3.5z"/></svg>';
+
+// page address -> { at, type, body } (no body = no usable icon) or { pending }
+const siteIcons = new Map();
+
+const attr = (tag, name) => {
+  const m = tag.match(new RegExp("\\s" + name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", "i"));
+  return m ? (m[1] ?? m[2] ?? m[3]).replace(/&amp;/g, "&") : null;
+};
+
+// Best first: SVG, then a 32-256px bitmap, any other bitmap, apple-touch-icon, .ico
+function iconCandidates(html, page) {
+  const found = [];
+  for (const tag of html.match(/<link\b[^>]*>/gi) || []) {
+    const rel = (attr(tag, "rel") || "").toLowerCase().split(/\s+/);
+    const href = attr(tag, "href");
+    if (!href || !(rel.includes("icon") || rel.includes("apple-touch-icon"))) continue;
+    let url;
+    try {
+      url = new URL(href, page);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "https:" && url.protocol !== "http:") continue;
+    const type = (attr(tag, "type") || "").toLowerCase();
+    const path = url.pathname.toLowerCase();
+    const size = Number(((attr(tag, "sizes") || "").match(/\d+/) || [])[0]) || 0;
+    let rank;
+    if (type.includes("svg") || path.endsWith(".svg")) rank = 0;
+    else if (type.includes("icon") || path.endsWith(".ico")) rank = 4;
+    else if (rel.includes("apple-touch-icon")) rank = 3;
+    else rank = size >= 32 && size <= 256 ? 1 : 2;
+    found.push({ url: url.href, rank, size });
+  }
+  found.sort((a, b) => a.rank - b.rank || Math.abs(a.size - 64) - Math.abs(b.size - 64));
+  const urls = found.map((f) => f.url);
+  urls.push(new URL("/favicon.ico", page).href);
+  return [...new Set(urls)];
+}
+
+async function download(url) {
+  const res = await fetch(url, { signal: AbortSignal.timeout(5000), headers: { accept: "image/*" } });
+  const type = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase();
+  if (!res.ok || !type.startsWith("image/") || Number(res.headers.get("content-length")) > SITE_ICON_MAX_BYTES) {
+    res.body?.cancel().catch(() => {});
+    return null;
+  }
+  const body = Buffer.from(await res.arrayBuffer());
+  return body.length && body.length <= SITE_ICON_MAX_BYTES ? { type, body } : null;
+}
+
+async function resolveIcon(page) {
+  let html = "";
+  let base = page;
+  try {
+    const res = await fetch(page, { signal: AbortSignal.timeout(5000), headers: { accept: "text/html" } });
+    base = res.url || page;
+    if (res.ok) html = (await res.text()).slice(0, 500000);
+  } catch {
+    // app down or unreachable: only /favicon.ico is tried
+  }
+  for (const url of iconCandidates(html, base)) {
+    try {
+      const icon = await download(url);
+      if (icon) return icon;
+    } catch {
+      // next candidate
+    }
+  }
+  return null;
+}
+
+function siteIcon(page) {
+  const hit = siteIcons.get(page);
+  if (hit?.pending) return hit.pending;
+  if (hit && Date.now() - hit.at < (hit.body ? SITE_ICON_TTL_MS : SITE_ICON_RETRY_MS)) return Promise.resolve(hit);
+  const pending = resolveIcon(page).then((icon) => {
+    const entry = { at: Date.now(), ...icon };
+    siteIcons.set(page, entry);
+    return entry;
+  });
+  siteIcons.set(page, { pending });
+  return pending;
+}
+
+async function siteIconFor(name) {
+  const c = (await snapshot()).containers.find((x) => x.name === name);
+  const page = c && c.url && publicUrl(c.url);
+  const icon = page ? await siteIcon(page) : null;
+  // The icon comes from the app; never let it act as a page on this origin
+  const headers = { "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; sandbox" };
+  return icon?.body
+    ? { type: icon.type, body: icon.body, cache: "private, max-age=3600", headers }
+    : { type: "image/svg+xml", body: GLOBE, cache: "private, max-age=300", headers };
+}
+
 // ---------------------------------------------------------------- widgets
 // umbrelOS draws these itself (same glass look as the built-in widgets).
 
@@ -308,6 +417,15 @@ const appLink = (c, cls) => {
     : "";
 };
 
+// The app's own icon (see siteIconFor), linking to its public address
+const appIcon = (c) => {
+  const href = c.url && publicUrl(c.url);
+  return href
+    ? '<a class="fav" href="' + escape(href) + '" target="_blank" rel="noopener noreferrer" title="Open ' + escape(href) + '">' +
+        '<img src="site-icon?app=' + escape(encodeURIComponent(c.name)) + '" alt="" width="20" height="20"></a>'
+    : "";
+};
+
 // Stroke icons in the Tabler style umbrelOS uses
 const ICONS = {
   postgres: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6M4.5 12v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-6"/>',
@@ -403,7 +521,10 @@ const STYLE = [
   ".pill small { color: var(--muted); font: 11px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
   ".url { display: inline-flex; align-items: center; gap: 4px; min-width: 0; color: var(--neon); font: 11.5px var(--mono); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }",
   ".url span { overflow: hidden; text-overflow: ellipsis; } .url .ic { width: 12px; height: 12px; opacity: .8; } .url:hover, .url:focus-visible { text-decoration: underline; outline: none; }",
-  ".pill .url { font-size: 11px; cursor: pointer; }",
+  ".fav { width: 30px; height: 30px; margin-left: -5px; border-radius: 10px; display: grid; place-items: center; flex: none; border: 1px solid var(--line);",
+  "  background: rgba(255,255,255,.07); transition: border-color .2s, box-shadow .2s; }",
+  ".fav img { width: 20px; height: 20px; border-radius: 5px; object-fit: contain; }",
+  ".fav:hover, .fav:focus-visible { outline: none; border-color: rgba(34,211,238,.55); box-shadow: 0 0 0 3px rgba(34,211,238,.12), 0 0 16px -4px var(--neon); }",
   ".res { height: 54px; padding: 0 14px 0 9px; border-radius: 16px; border-color: color-mix(in srgb, var(--c) 32%, transparent);",
   "  background: linear-gradient(90deg, color-mix(in srgb, var(--c) 9%, transparent), rgba(255,255,255,.02)); box-shadow: 0 0 26px -12px var(--c); }",
   ".res .ico { width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center; flex: none; color: var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); }",
@@ -481,6 +602,7 @@ const STYLE = [
   "  .links { margin-left: 0; width: 100%; } .sub .extra { display: none; }",
   "  .map { padding: 14px 10px; grid-template-columns: minmax(0, 1.25fr) minmax(24px, .45fr) minmax(0, 1fr); }",
   "  .pill { padding: 0 11px; gap: 8px; } .res { padding: 0 10px 0 7px; } .res .ico { width: 28px; height: 28px; } .res .dot { display: none; }",
+  "  .fav { width: 26px; height: 26px; margin-left: -3px; border-radius: 8px; } .fav img { width: 17px; height: 17px; }",
   "  .row { grid-template-columns: 8px minmax(0, 1fr) 112px; } .row .chips { grid-column: 2; grid-row: 2; } .row .mem { grid-column: 3; grid-row: 1 / span 2; }",
   "  .nm { flex-direction: column; align-items: flex-start; gap: 1px; } .nm b { max-width: 100%; }",
   "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
@@ -548,11 +670,10 @@ function resourceMap(snap, mem) {
 
   const left = apps
     .map((c) => {
-      const link = appLink(c, "url");
       const sub = c.project && c.project !== c.name ? c.project : "";
       return (
         '<div class="pill" data-app="' + escape(c.name) + '" title="' + escape(c.name + " · " + c.status) + '"><span class="dot st-' + c.state + '"></span>' +
-        '<span class="t"><b>' + escape(c.name) + "</b>" + (link || (sub ? "<small>" + escape(sub) + "</small>" : "")) + "</span></div>"
+        appIcon(c) + '<span class="t"><b>' + escape(c.name) + "</b>" + (sub ? "<small>" + escape(sub) + "</small>" : "") + "</span></div>"
       );
     })
     .join("");
@@ -818,21 +939,24 @@ const routes = {
   "/widgets/gauges": async () => ({ type: "application/json", body: JSON.stringify(await gaugesWidget()) }),
   "/healthz": async () => ({ type: "text/plain", body: "ok" }),
   "/favicon.svg": async () => ({ type: "image/svg+xml", body: FAVICON, cache: "public, max-age=86400" }),
+  "/site-icon": async (url) => siteIconFor(url.searchParams.get("app")),
   "/live": async () => ({ type: "text/html; charset=utf-8", body: (await livePart()).html }),
   "/": async () => ({ type: "text/html; charset=utf-8", body: await statusPage() }),
 };
 
 http
   .createServer(async (req, res) => {
-    const path = new URL(req.url, "http://localhost").pathname;
-    const route = req.method === "GET" ? routes[path] : undefined;
+    const url = new URL(req.url, "http://localhost");
+    const route = req.method === "GET" ? routes[url.pathname] : undefined;
     if (!route) {
       res.writeHead(404, { "content-type": "text/plain" }).end("Not found");
       return;
     }
     try {
-      const { type, body, cache } = await route();
-      res.writeHead(200, { "content-type": type, "cache-control": cache || "no-store" }).end(body);
+      const { type, body, cache, headers } = await route(url);
+      res
+        .writeHead(200, { "content-type": type, "cache-control": cache || "no-store", "x-content-type-options": "nosniff", ...headers })
+        .end(body);
     } catch (error) {
       res.writeHead(500, { "content-type": "text/plain" }).end(String(error?.message || error));
     }

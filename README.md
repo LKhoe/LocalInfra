@@ -266,10 +266,12 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
 
 - **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the
   Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
-  links. An app's public address shows under its name, as a link, when it has the label
-  `localinfra.url=https://...` (the app template sets it from `NEXT_PUBLIC_APP_URL`).
-- **Projects**: every container with its status, resources and memory (used / limit), LocalInfra
-  included.
+  links. When an app has the label `localinfra.url=https://...` (the app template sets it from
+  `NEXT_PUBLIC_APP_URL`), the map shows the app's own icon, linking to that address. The server
+  reads the icon from the app's `<link rel="icon">` (SVG first, then a small PNG, then
+  `/favicon.ico`), keeps it for 12 hours, and shows a globe while the app can't be reached.
+- **Projects**: every container with its status, resources, public address and memory
+  (used / limit), LocalInfra included.
 - **Guides**: adding a Cloudflare tunnel route and a Google OAuth client, with the values for the
   chosen app and your domain filled in.
 
@@ -288,7 +290,8 @@ It is one container: the stock `node:24-alpine` image running
 `localinfra-health/server.mjs.template`, non-root, read-only filesystem, no
 capabilities. It reads the Docker socket through the host's `docker` group (gid 987 on
 umbrelOS) and only calls `GET /containers/json` and, while the status page is open,
-`GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings.
+`GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings. The only
+other outbound requests fetch the icons of the apps' `localinfra.url` addresses.
 
 ### Install (once, in the Umbrel UI)
 
