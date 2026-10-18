@@ -8,19 +8,21 @@ small umbrelOS app that shows whether your containers are healthy.
 | PostgreSQL 17 | `localinfra-postgres` | `localinfra_postgres` | own role + own database; other roles can't even connect |
 | Redis 7.4 | `localinfra-redis` | `localinfra_redis` | own ACL user, limited to keys/channels `<project>:*` |
 | S3 (Garage 2.4) | `localinfra-s3` | `localinfra_s3` | own bucket + own access key; can't see, create or delete other buckets |
+| LLM | `localinfra-llm` | `localinfra_llm` | own key + own limits on paid calls, see [LLM gateway](#llm-gateway) |
 | Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database + copy of Home Assistant's backup to the external drive |
 | Cloudflare tunnel | `localinfra-tunnel` | `localinfra_tunnel` | reaches only the apps that join `localinfra_tunnel` |
 | Container Health | `localinfra-health_server_1` | (umbrelOS app) | home-screen widgets, see [section 6](#6-container-health-widget-umbrelos) |
 
-Projects don't run their own Postgres, Redis or file storage. They join the network(s) they need as
+Projects don't run their own Postgres, Redis, file storage or LLM keys. They join the network(s) they need as
 **external** networks and use the credentials made by `scripts/new-project.sh`.
 
 ```
 LocalInfra/
-  compose.yml                   postgres + redis + s3 + backup + tunnel
+  compose.yml                   postgres + redis + s3 + llm + backup + tunnel
   .env.example                  copy to .env (secrets, backup path, schedule)
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
+  llm/                          Ollama image + the LLM gateway (server.mjs, store.mjs, admin.mjs, start.sh)
   backup/                       tiny image: pg_dump + busybox crond (backup.sh, backup-homeassistant.sh)
   scripts/bootstrap-pi.sh       first deploy from the Mac: LocalInfra + yarg, with checks
   scripts/new-project.sh        provision a project (db role + redis user + S3 key), print its env
@@ -124,6 +126,7 @@ covers a dead disk but not deletions or the Pi being lost.
 ```bash
 cp .env.example .env
 openssl rand -hex 32     # one each: POSTGRES_SUPERUSER_PASSWORD, REDIS_ADMIN_PASSWORD, S3_RPC_SECRET, S3_ADMIN_TOKEN
+# set OPENROUTER_API_KEY=<key from openrouter.ai/settings/keys>   (the only OpenRouter key; apps get their own LLM key)
 # set CLOUDFLARE_TUNNEL_TOKEN=<token from Zero Trust → Networks → Tunnels → the tunnel>
 # set BACKUP_DIR=<mountpoint>/localinfra-backups   (a path ON THE PI)
 # set S3_DATA_DIR=<mountpoint>/localinfra-s3        (a path ON THE PI)
@@ -178,18 +181,21 @@ running.
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp              # postgres + redis
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-redis   # postgres only
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --s3         # postgres + redis + S3 bucket/key
+DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --llm        # postgres + redis + LLM key
+DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-postgres --no-redis --llm   # just an LLM key
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --rotate     # new passwords, data untouched
 ```
 
 The script prints the env block for the project (`DATABASE_URL`, `POSTGRES_HOST`,
 `REDIS_HOST`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_KEY_PREFIX`, and with `--s3`:
-`S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`). Put it in the
+`S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`; with `--llm`:
+`LLM_BASE_URL`, `LLM_API_KEY`). Put it in the
 project's `.env` and join the networks in its compose:
 
 ```yaml
 services:
   app:
-    networks: [localinfra_postgres, localinfra_redis]   # + localinfra_s3 with --s3
+    networks: [localinfra_postgres, localinfra_redis]   # + localinfra_s3 with --s3, localinfra_llm with --llm
 networks:
   localinfra_postgres: { external: true }
   localinfra_redis:    { external: true }
@@ -211,12 +217,67 @@ Tunnels), not in this repo; `localinfra-tunnel` only needs `CLOUDFLARE_TUNNEL_TO
 on a connection *without* `keyPrefix`; channel names prefixed by hand). Anything else
 gets `NOPERM`.
 
+### LLM gateway
+
+`localinfra-llm` is one OpenAI-compatible endpoint for every app, with three **tiers**. Apps ask
+for a tier, never for a model:
+
+| `model` | For | Models (tried in order, `LLM_*_MODELS` in `.env`) | Cost |
+|---|---|---|---|
+| `simple` | titles, translations, short rewrites | free OpenRouter models (`google/gemma-4-31b-it:free`, `openrouter/free`), then the **local model** (`gemma3:1b` on the Pi) when they fail or are rate-limited | free, no limit |
+| `medium` | extraction, structured JSON, tool use | `anthropic/claude-haiku-5.5`, `openai/gpt-6-luna` | ~$0.10 / $0.50 per M tokens in / out |
+| `hard` | reasoning, long or tricky answers | `anthropic/claude-sonnet-5.5`, `openai/gpt-6.1-sol` | ~$2 / $10 per M tokens |
+
+```ts
+const res = await fetch(`${process.env.LLM_BASE_URL}/chat/completions`, {
+  method: "POST",
+  headers: { Authorization: `Bearer ${process.env.LLM_API_KEY}`, "Content-Type": "application/json" },
+  body: JSON.stringify({ model: "medium", messages, response_format: { type: "json_object" } }),
+});
+// 200: OpenAI-shaped answer, plus localinfra: { tier, provider: "openrouter" | "local", cost_usd }
+// 429: error.code "monthly_budget_exceeded" | "daily_paid_calls_exceeded" (paid tiers only)
+```
+
+The OpenAI SDKs work too (`baseURL: LLM_BASE_URL`, `apiKey: LLM_API_KEY`). Allowed fields:
+`messages`, `temperature`, `top_p`, `max_tokens` (capped at `LLM_MAX_TOKENS`, 8192), `stop`, `seed`,
+`response_format`, `tools`, `tool_choice`, `parallel_tool_calls`, `frequency_penalty`,
+`presence_penalty`, `reasoning`. Anything else (another model, `models`, `provider`) is dropped, so
+an app can't pick a pricier model than its tier. No streaming. The local model can't call tools:
+a `simple` request with `tools` only works while the free models answer.
+
+**Limits on paid calls**, per app: a monthly budget in USD (`LLM_DEFAULT_MONTHLY_USD`, $2) and a
+number of paid calls per day (`LLM_DEFAULT_DAILY_PAID_CALLS`, 200), counted on `medium` + `hard`
+together. The spend is OpenRouter's own figure for each call. Past either limit, paid calls get
+`429` until the next month/day (container `TZ`); `simple` keeps working.
+
+```bash
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin list                 # apps, spend, limits
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin usage my_recipes     # per tier: calls, tokens, $
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin limits my_recipes --monthly-usd 5 --daily-calls 500
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin limits my_recipes --monthly-usd default
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin limits my_recipes --monthly-usd 0     # no paid calls at all
+curl -s -H "Authorization: Bearer $LLM_API_KEY" http://localinfra-llm:4000/v1/usage           # from the app: its own usage
+```
+
+One container runs both processes ([llm/start.sh](llm/start.sh)): the gateway on port 4000, and
+Ollama on `127.0.0.1:11434` inside the container, so apps can't reach the local model directly.
+The first start downloads the local model (about 800 MB) into the `llm_data` volume; the gateway
+answers meanwhile, and `GET /health` shows `local.state` (`downloading`, `ready`). The model stays
+in memory 30 minutes after its last call (`LLM_LOCAL_KEEP_ALIVE`). The gateway logs one line per
+call (app, tier, model, tokens, cost), never the prompt.
+
+The volume also holds the app keys (hashed) and the call log; it isn't in the nightly backup. If
+it's lost, re-issue each app's key with `new-project.sh <app> --no-postgres --no-redis --llm --rotate`.
+
+Tests: `node --test llm/test.mjs` (fake OpenRouter and Ollama, no network).
+
 Removing a project (irreversible):
 
 ```bash
 DOCKER_CONTEXT=umbrel docker exec localinfra-s3 garage key delete --yes <key id>        # garage key list
 DOCKER_CONTEXT=umbrel docker exec localinfra-s3 garage bucket delete --yes myapp         # must be empty
 DOCKER_CONTEXT=umbrel docker exec localinfra-postgres psql -U postgres -c 'DROP DATABASE myapp' -c 'DROP ROLE myapp'
+DOCKER_CONTEXT=umbrel docker exec localinfra-llm llm-admin remove myapp
 DOCKER_CONTEXT=umbrel docker exec -e REDISCLI_AUTH="$(sed -n 's/^REDIS_ADMIN_PASSWORD=//p' .env)" localinfra-redis \
   sh -c 'redis-cli --no-auth-warning ACL DELUSER myapp && redis-cli --no-auth-warning ACL SAVE'
 ```
@@ -283,8 +344,8 @@ widgets.
 
 The status page refreshes every 15 seconds (only while it's visible) and shows:
 
-- **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the
-  Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
+- **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the LLM
+  gateway, the Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
   links. When an app has the label `localinfra.url=https://...` (the app template sets it from
   `NEXT_PUBLIC_APP_URL`), the map shows the app's own icon, linking to that address. The server
   reads the icon from the app's `<link rel="icon">` (SVG first, then a small PNG, then
@@ -350,15 +411,15 @@ BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local HA_BACKUP_SOURCE=./ha-backups-
 DOCKER_CONTEXT=desktop-linux scripts/new-project.sh yarg
 ```
 
-Postgres, Redis and S3 then listen on `127.0.0.1:5432`, `127.0.0.1:6379` and
-`127.0.0.1:3900`. The printed
+Postgres, Redis, S3 and the LLM gateway then listen on `127.0.0.1:5432`, `127.0.0.1:6379`,
+`127.0.0.1:3900` and `127.0.0.1:4000` (`LLM_BASE_URL=http://localhost:4000/v1`). The printed
 env uses the container names as hosts (`localinfra-postgres`, `localinfra-redis`); an
 app running directly on the Mac (`npm run dev`) uses `localhost` instead.
 
 To reach the **Pi's** databases from the Mac (TablePlus, Drizzle Studio, ...):
 
 ```bash
-ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 umbrel@umbrel.local
+ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 -L 14000:127.0.0.1:4000 umbrel@umbrel.local
 ```
 
 ## Notes
@@ -370,8 +431,10 @@ ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 u
 - **What's isolated, and what isn't:** credentials and permissions separate the
   projects. Projects on the same network can still reach each other's containers, so
   don't run admin UIs without auth on these networks.
-- **Ports:** Postgres, Redis and the S3 API are published on the Pi's loopback only
-  (`POSTGRES_PUBLISH` / `REDIS_PUBLISH` / `S3_PUBLISH`); use the SSH tunnel above to reach
+- **Ports:** Postgres, Redis, the S3 API and the LLM gateway are published on the Pi's loopback only
+  (`POSTGRES_PUBLISH` / `REDIS_PUBLISH` / `S3_PUBLISH` / `LLM_PUBLISH`); use the SSH tunnel above to reach
   them. Garage's RPC and admin ports are never published.
+- **Upgrading Ollama:** bump `OLLAMA_VERSION`, then `DOCKER_CONTEXT=umbrel docker compose up -d --build llm`.
+  Another local model: set `LLM_LOCAL_MODEL` (any tag from ollama.com/library) and recreate `llm`.
 - **Upgrading Garage:** bump `GARAGE_VERSION`, then `DOCKER_CONTEXT=umbrel docker compose up -d --build s3`.
   Read the release notes first for major versions.

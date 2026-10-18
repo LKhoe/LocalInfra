@@ -7,14 +7,17 @@
 #             with admin commands and FLUSHALL/FLUSHDB blocked.
 #   S3:       (opt-in, --s3) Garage bucket <name with _ -> -> and access key <name>, allowed to
 #             read/write that bucket only: it can't see other buckets, create or delete buckets.
+#   LLM:      (opt-in, --llm) an app key for the LLM gateway (localinfra-llm), with the default
+#             limits on paid calls; change them with  docker exec localinfra-llm llm-admin limits
 #
 # Usage:
-#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis] [--s3]
+#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis] [--s3] [--llm]
 #
 #   --rotate       project already exists: issue new passwords/keys (data is untouched)
 #   --no-postgres  skip the Postgres role + database
 #   --no-redis     skip the Redis user
 #   --s3           also create the S3 bucket + access key (Garage)
+#   --llm          also create an LLM gateway key
 #
 # Runs against whatever your docker CLI points at: on the Pi itself, or from the
 # Mac with  DOCKER_CONTEXT=umbrel scripts/new-project.sh <name>
@@ -25,8 +28,9 @@ cd "$(dirname "$0")/.."
 PG_CONTAINER=localinfra-postgres
 REDIS_CONTAINER=localinfra-redis
 S3_CONTAINER=localinfra-s3
+LLM_CONTAINER=localinfra-llm
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # Read KEY from .env without executing it (values may contain spaces, "*", ...)
 env_get() {
@@ -36,13 +40,14 @@ env_get() {
 
 gen_password() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-name=""; rotate=false; want_pg=true; want_redis=true; want_s3=false
+name=""; rotate=false; want_pg=true; want_redis=true; want_s3=false; want_llm=false
 for arg in "$@"; do
   case "$arg" in
     --rotate) rotate=true ;;
     --no-postgres) want_pg=false ;;
     --no-redis) want_redis=false ;;
     --s3) want_s3=true ;;
+    --llm) want_llm=true ;;
     -h|--help) usage ;;
     -*) echo "Unknown option: $arg" >&2; usage ;;
     *) [[ -z "$name" ]] || usage; name="$arg" ;;
@@ -163,6 +168,21 @@ if $want_s3; then
   echo "S3: bucket \"$S3_BUCKET\" + key \"$name\" ($S3_KEY_ID) ready (read/write on that bucket only)." >&2
 fi
 
+# ---------------------------------------------------------------- LLM gateway
+llm_admin() { docker exec -i "$LLM_CONTAINER" llm-admin "$@"; }
+if $want_llm; then
+  require_healthy "$LLM_CONTAINER"
+  if llm_admin has "$name" && [[ "$rotate" != true ]]; then
+    echo "LLM key \"$name\" already exists. Use --rotate to issue a new one." >&2
+    exit 1
+  fi
+  LLM_KEY=$(llm_admin rotate "$name")
+  if [[ ! "$LLM_KEY" =~ ^llm_[0-9a-f]{48}$ ]]; then
+    echo "Could not read the new LLM key from llm-admin." >&2; exit 1
+  fi
+  echo "LLM: key \"$name\" ready. $(llm_admin limits "$name" | sed "s/^$name: //")" >&2
+fi
+
 # ---------------------------------------------------------------- Output
 echo >&2
 echo "# ---- add to the project's .env (on the machine that runs its compose) ----" >&2
@@ -191,9 +211,16 @@ S3_ACCESS_KEY_ID=$S3_KEY_ID
 S3_SECRET_ACCESS_KEY=$S3_SECRET
 EOF
 fi
+if $want_llm; then
+  cat <<EOF
+LLM_BASE_URL=http://$LLM_CONTAINER:4000/v1
+LLM_API_KEY=$LLM_KEY
+EOF
+fi
 echo >&2
 nets=()
 $want_pg && nets+=("localinfra_postgres")
 $want_redis && nets+=("localinfra_redis")
 $want_s3 && nets+=("localinfra_s3")
+$want_llm && nets+=("localinfra_llm")
 echo "# and join the external network(s): ${nets[*]}" >&2

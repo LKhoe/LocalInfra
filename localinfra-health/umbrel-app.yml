@@ -2,7 +2,7 @@ manifestVersion: 1
 id: localinfra-health
 category: developer
 name: Container Health
-version: "1.2.4"
+version: "1.2.5"
 tagline: See at a glance whether the containers you run are healthy
 icon: https://raw.githubusercontent.com/LKhoe/LocalInfra/main/localinfra-health/icon.svg
 description: >-
@@ -13,7 +13,7 @@ description: >-
 
 
   The status page also maps which LocalInfra resources (Postgres, Redis, S3, the
-  Cloudflare tunnel) each container uses, shows each container's memory, and has
+  LLM gateway, the Cloudflare tunnel) each container uses, shows each container's memory, and has
   step-by-step guides for publishing an app on Cloudflare and adding Google sign-in.
 
 
@@ -21,7 +21,7 @@ description: >-
   The app only reads from Docker (the container list and memory readings); it never
   changes anything.
 releaseNotes: >-
-  The resource map shows each app's own icon (its favicon), linking to its public address.
+  The resource map shows the LLM gateway (localinfra-llm) and the apps that use it.
 developer: LKhoe
 website: https://github.com/LKhoe/LocalInfra
 repo: https://github.com/LKhoe/LocalInfra

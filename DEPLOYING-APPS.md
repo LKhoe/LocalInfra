@@ -10,6 +10,7 @@ app. Reference implementation: **my-recipes**.
                                               ├─ localinfra_postgres → db + role <app_name>
                                               ├─ localinfra_redis    → ACL user, keys "<app_name>:*"
                                               ├─ localinfra_s3       → bucket <app-name> + key
+                                              ├─ localinfra_llm      → LLM key, limits on paid calls
                                               └─ localinfra_tunnel   → Cloudflare tunnel → https://<app>.<domain>
 ```
 
@@ -26,7 +27,7 @@ What every app needs before it can be deployed. The templates in
 | | Rule | Why |
 |---|---|---|
 | 1 | `docker-compose.yml` has **one service**; `container_name`, service name and image name are the app name (kebab-case), image tag `:latest` | `deploy.sh` reads everything from compose and keeps `<app>:previous` for rollback |
-| 2 | **No database, Redis or file volume of its own**: data goes to LocalInfra Postgres / Redis / S3 | one place to run, back up and monitor |
+| 2 | **No database, Redis or file volume of its own**: data goes to LocalInfra Postgres / Redis / S3. **No LLM API key of its own**: LLM calls go to LocalInfra's gateway | one place to run, back up, monitor and pay for |
 | 3 | **No bind mounts** (`./file:/path`) | compose runs on the Mac, the paths would be looked up on the Pi |
 | 4 | Joins LocalInfra's networks as **external** networks, plus `localinfra_tunnel` if public | the tunnel and the shared services are reachable by container name |
 | 5 | A **healthcheck** on `GET /api/health` that checks the app's dependencies (DB, bucket, ...) | `deploy.sh` waits for it; the widget turns red when it fails |
@@ -35,7 +36,7 @@ What every app needs before it can be deployed. The templates in
 | 8 | The container **migrates on start** (entrypoint: wait for Postgres → migrate → start) | no manual step after a deploy |
 | 9 | Runtime deps come from the **lockfile** (`npm ci --omit=dev` in the runner stage), never `npm install <pkg>` | a bare install re-resolves every dependency; native modules (sharp) end up with mismatched versions |
 | 10 | **`.env` = the Pi, `.env.local` = local dev**, both git-ignored together with `.env.bak-*` | compose reads `.env` on the Mac; Next.js and dev scripts let `.env.local` win |
-| 11 | Redis keys/channels start with `REDIS_KEY_PREFIX`; S3 uses path-style requests, region `garage`; the bucket is never exposed, the app serves its files itself | LocalInfra's isolation rules (README section 4) |
+| 11 | Redis keys/channels start with `REDIS_KEY_PREFIX`; S3 uses path-style requests, region `garage`; the bucket is never exposed, the app serves its files itself; LLM calls ask for a tier (`simple`/`medium`/`hard`) and handle `429` | LocalInfra's isolation rules (README section 4) |
 
 ### Port table
 
@@ -82,8 +83,11 @@ Add the app to the port table above.
 ### 2. Provision on LocalInfra and write `.env` (once)
 
 ```bash
-DOCKER_CONTEXT=umbrel ../LocalInfra/scripts/provision-app.sh <app_name> <path/to/app> [--no-redis] [--s3]
+DOCKER_CONTEXT=umbrel ../LocalInfra/scripts/provision-app.sh <app_name> <path/to/app> [--no-redis] [--s3] [--llm]
 ```
+
+An app that already exists and only needs the LLM key:
+`provision-app.sh <app_name> <path/to/app> --no-postgres --no-redis --llm` (then `./deploy.sh`).
 
 `<app_name>` uses `_`, not `-` (`my_recipes`): it names the database, the role and the keys.
 The script creates them, writes the credentials into the app's `.env` (from `.env.example` if

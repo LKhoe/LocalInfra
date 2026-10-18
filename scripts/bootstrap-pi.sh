@@ -104,6 +104,7 @@ wait_healthy localinfra-postgres 120
 wait_healthy localinfra-redis 60
 wait_healthy localinfra-s3 60
 wait_healthy localinfra-tunnel 60
+wait_healthy localinfra-llm 120
 [[ "$(docker inspect -f '{{.State.Status}}' localinfra-backup)" == running ]] || die "localinfra-backup is not running"
 ok "localinfra-backup is running"
 

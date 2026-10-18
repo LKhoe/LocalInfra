@@ -45,6 +45,7 @@ const RESOURCES = [
   { key: "postgres", label: "Postgres", short: "PG", network: "localinfra_postgres", provider: "localinfra-postgres" },
   { key: "redis", label: "Redis", short: "RD", network: "localinfra_redis", provider: "localinfra-redis" },
   { key: "s3", label: "S3", short: "S3", network: "localinfra_s3", provider: "localinfra-s3" },
+  { key: "llm", label: "LLM", short: "AI", network: "localinfra_llm", provider: "localinfra-llm" },
   // Every app on this network can be reached by the Cloudflare tunnel
   { key: "tunnel", label: "Tunnel", short: "CF", network: "localinfra_tunnel", provider: "localinfra-tunnel" },
 ];
@@ -431,6 +432,7 @@ const ICONS = {
   postgres: '<ellipse cx="12" cy="6" rx="7.5" ry="2.8"/><path d="M4.5 6v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8V6M4.5 12v6c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-6"/>',
   redis: '<path d="m12 4-8 4 8 4 8-4-8-4zM4 12l8 4 8-4M4 16l8 4 8-4"/>',
   s3: '<path d="M4 6.5c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5S16.4 4 12 4 4 5.1 4 6.5zm0 0 1.8 12c.2 1.4 2.9 2.3 6.2 2.3s6-.9 6.2-2.3L20 6.5"/>',
+  llm: '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1-5.1-1.9 5.1-1.9L12 3.5zM18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"/>',
   tunnel: '<path d="M7 18.5a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9a4.3 4.3 0 0 1-.4 9.5H7z"/>',
   google: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M12.5 12h7"/>',
   out: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
@@ -461,7 +463,7 @@ const icon = (name, cls) =>
 const STYLE = [
   ":root { color-scheme: dark; --bg: #06060b; --text: #ececf4; --muted: rgba(236,236,244,.56); --faint: rgba(236,236,244,.3);",
   "  --line: rgba(255,255,255,.08); --ok: #4ade80; --warn: #fbbf24; --bad: #fb7185; --idle: #94a3b8;",
-  "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
+  "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --llm: #c084fc; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
   "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
   "* { box-sizing: border-box; }",
   "html { background: var(--bg); }",
