@@ -2,7 +2,8 @@
 // yourself (LocalInfra, your projects), skipping the ones umbrelOS manages.
 //
 // Read-only by design: the only Docker API calls are GET /containers/json and, for
-// the status page only, GET /containers/<id>/stats (one-shot memory reading).
+// the status page only, GET /containers/<id>/stats (one-shot memory reading) and, once
+// per container, GET /containers/<id>/json + /archive to read its app version.
 // The status page also shows each app's icon, fetched from its public address.
 // No dependencies; runs on a stock node:alpine image.
 //
@@ -32,6 +33,9 @@ const MEMORY_TTL_MS = 10000;
 const SITE_ICON_TTL_MS = 12 * 3600 * 1000;
 const SITE_ICON_RETRY_MS = 10 * 60 * 1000;
 const SITE_ICON_MAX_BYTES = 256 * 1024;
+// Version label an image can set (docker build --label / LABEL in the Dockerfile)
+const VERSION_LABEL = "org.opencontainers.image.version";
+const PACKAGE_JSON_MAX_BYTES = 256 * 1024;
 
 const STATES = {
   ok: { rank: 0, emoji: "✅", label: "Healthy" },
@@ -50,21 +54,22 @@ const RESOURCES = [
   { key: "tunnel", label: "Tunnel", short: "CF", network: "localinfra_tunnel", provider: "localinfra-tunnel" },
 ];
 
-function dockerGet(path) {
+// Raw body of a GET; the error carries the HTTP status (404 = no such file, for /archive)
+function dockerRaw(path, maxBytes = Infinity) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { socketPath: DOCKER_SOCKET, path, method: "GET", timeout: 5000 },
       (res) => {
-        let body = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => (body += chunk));
+        const chunks = [];
+        let size = 0;
+        res.on("data", (chunk) => {
+          size += chunk.length;
+          if (size > maxBytes) return req.destroy(new Error("Docker API response too large"));
+          chunks.push(chunk);
+        });
         res.on("end", () => {
-          if (res.statusCode !== 200) return reject(new Error("Docker API " + res.statusCode));
-          try {
-            resolve(JSON.parse(body));
-          } catch (error) {
-            reject(error);
-          }
+          if (res.statusCode !== 200) return reject(Object.assign(new Error("Docker API " + res.statusCode), { status: res.statusCode }));
+          resolve(Buffer.concat(chunks));
         });
       },
     );
@@ -73,6 +78,8 @@ function dockerGet(path) {
     req.end();
   });
 }
+
+const dockerGet = async (path) => JSON.parse((await dockerRaw(path)).toString("utf8"));
 
 function classify(container) {
   const status = container.Status || "";
@@ -109,6 +116,7 @@ function describe(c) {
     running: c.State === "running" || c.State === "restarting",
     status: c.Status || c.State,
     image: c.Image,
+    imageVersion: c.Labels?.[VERSION_LABEL] || null,
     url: c.Labels?.[URL_LABEL] || null,
     port: (c.Ports || []).find((p) => p.Type === "tcp")?.PrivatePort || 3000,
     // A provider doesn't "use" its own network
@@ -183,6 +191,86 @@ async function memoryFor(targets) {
     return byId;
   })().finally(() => (memoryCache.pending = null));
   return memoryCache.pending;
+}
+
+// ---------------------------------------------------------------- versions
+// What each container runs, for the project list. In order: the image's version label,
+// the image tag (postgres:17-alpine, localinfra-s3:v2.4.1), and for ":latest" images (the
+// apps deployed with deploy.sh) the "version" of package.json in the container's working
+// dir, read once per container through Docker's read-only archive endpoint.
+
+// container id -> { version, source } (version null = none found)
+const versionCache = new Map();
+let versionsPending = null;
+
+// "repo/name:tag@sha256:..." -> "tag"; none for ":latest", bare names and image ids
+function imageTag(image) {
+  const ref = (image || "").split("@")[0];
+  if (ref.startsWith("sha256:")) return null;
+  const colon = ref.lastIndexOf(":");
+  if (colon < 0 || colon < ref.lastIndexOf("/")) return null;
+  const tag = ref.slice(colon + 1);
+  return tag && tag !== "latest" ? tag : null;
+}
+
+// The first regular file in a tar stream (GET /archive answers with a tar)
+function firstTarFile(buf) {
+  for (let off = 0; off + 512 <= buf.length; ) {
+    const header = buf.subarray(off, off + 512);
+    if (header.every((b) => b === 0)) return null;
+    const size = parseInt(header.subarray(124, 136).toString("latin1").replace(/[^0-7]/g, "") || "0", 8);
+    const type = String.fromCharCode(header[156]);
+    if (type === "0" || type === "\0") return buf.subarray(off + 512, off + 512 + size);
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return null;
+}
+
+async function packageVersion(id) {
+  const info = await dockerGet("/containers/" + id + "/json");
+  const dir = info.Config?.WorkingDir;
+  if (!dir) return null;
+  const file = (dir.endsWith("/") ? dir : dir + "/") + "package.json";
+  let tar;
+  try {
+    tar = await dockerRaw("/containers/" + id + "/archive?path=" + encodeURIComponent(file), PACKAGE_JSON_MAX_BYTES + 1024);
+  } catch (error) {
+    if (error.status === 404) return null;
+    throw error;
+  }
+  const body = firstTarFile(tar);
+  if (!body) return null;
+  const version = JSON.parse(body.toString("utf8")).version;
+  return typeof version === "string" && version ? version : null;
+}
+
+async function resolveVersion(c) {
+  if (c.imageVersion) return { version: c.imageVersion, source: "label " + VERSION_LABEL };
+  const tag = imageTag(c.image);
+  if (tag) return { version: tag, source: "image tag " + c.image.split("@")[0] };
+  const version = await packageVersion(c.id);
+  return { version, source: "package.json" };
+}
+
+async function versionsFor(containers) {
+  const ids = new Set(containers.map((c) => c.id));
+  for (const id of versionCache.keys()) if (!ids.has(id)) versionCache.delete(id);
+  const queue = containers.filter((c) => !versionCache.has(c.id));
+  if (queue.length && !versionsPending) {
+    const worker = async () => {
+      while (queue.length) {
+        const c = queue.shift();
+        try {
+          versionCache.set(c.id, await resolveVersion(c));
+        } catch {
+          // Docker busy or unreadable package.json: tried again on the next refresh
+        }
+      }
+    };
+    versionsPending = Promise.all([worker(), worker(), worker(), worker()]).finally(() => (versionsPending = null));
+  }
+  if (versionsPending) await versionsPending;
+  return versionCache;
 }
 
 // ---------------------------------------------------------------- app icons
@@ -551,6 +639,7 @@ const STYLE = [
   ".row { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto 150px; gap: 6px 14px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line); }",
   ".who { min-width: 0; } .who b { display: block; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
   ".nm { display: flex; align-items: baseline; gap: 10px; min-width: 0; } .nm b { flex: none; max-width: 60%; }",
+  ".ver { flex: none; font: 11px/1.5 var(--mono); color: var(--muted); padding: 0 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.04); white-space: nowrap; }",
   ".who small { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }",
   ".row.st-unhealthy .who small, .row.st-stopped .who small { color: var(--bad); }",
   ".chips { display: flex; gap: 5px; flex-wrap: wrap; }",
@@ -606,7 +695,7 @@ const STYLE = [
   "  .pill { padding: 0 11px; gap: 8px; } .res { padding: 0 10px 0 7px; } .res .ico { width: 28px; height: 28px; } .res .dot { display: none; }",
   "  .fav { width: 26px; height: 26px; margin-left: -3px; border-radius: 8px; } .fav img { width: 17px; height: 17px; }",
   "  .row { grid-template-columns: 8px minmax(0, 1fr) 112px; } .row .chips { grid-column: 2; grid-row: 2; } .row .mem { grid-column: 3; grid-row: 1 / span 2; }",
-  "  .nm { flex-direction: column; align-items: flex-start; gap: 1px; } .nm b { max-width: 100%; }",
+  "  .nm { flex-wrap: wrap; gap: 1px 8px; } .nm b { flex: 0 1 auto; max-width: 100%; } .nm .url { flex-basis: 100%; }",
   "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
   "  .mem em { display: none; } .steps li { line-height: 1.7; }",
   "}",
@@ -702,7 +791,14 @@ function resourceMap(snap, mem) {
   );
 }
 
-function containerRow(c, mem) {
+// "1.4.2" -> "v1.4.2"; tags like "17-alpine" or "v2.4.1" stay as they are
+function versionChip(v) {
+  if (!v || !v.version) return "";
+  const text = /^[0-9]+\.[0-9]/.test(v.version) ? "v" + v.version : v.version;
+  return '<span class="ver" title="Version (' + escape(v.source) + ')">' + escape(text.slice(0, 40)) + "</span>";
+}
+
+function containerRow(c, mem, versions) {
   const chips = c.uses
     .map((key) => {
       const r = RESOURCES.find((x) => x.key === key);
@@ -711,19 +807,19 @@ function containerRow(c, mem) {
     .join("");
   return (
     '<li class="row st-' + c.state + '"><span class="dot"></span>' +
-    '<div class="who"><span class="nm"><b>' + escape(c.name) + "</b>" + appLink(c, "url") + "</span><small>" + escape(c.status) + "</small></div>" +
+    '<div class="who"><span class="nm"><b>' + escape(c.name) + "</b>" + versionChip(versions.get(c.id)) + appLink(c, "url") + "</span><small>" + escape(c.status) + "</small></div>" +
     '<div class="chips">' + chips + "</div>" + memoryCell(mem.get(c.id)) + "</li>"
   );
 }
 
-function projectCard(p, mem) {
+function projectCard(p, mem, versions) {
   let used = 0;
   for (const c of p.containers) used += mem.get(c.id)?.used || 0;
   return (
     '<section class="proj glass"><div class="proj-h"><span class="dot st-' + p.state + '"></span><h3>' + escape(p.name) + "</h3>" +
     '<span class="n">' + p.ok + "/" + p.containers.length + " healthy</span>" +
     '<span class="m">' + (used ? bytes(used) : "") + "</span></div>" +
-    '<ul class="rows">' + p.containers.map((c) => containerRow(c, mem)).join("") + "</ul></section>"
+    '<ul class="rows">' + p.containers.map((c) => containerRow(c, mem, versions)).join("") + "</ul></section>"
   );
 }
 
@@ -731,7 +827,7 @@ function projectCard(p, mem) {
 async function livePart() {
   try {
     const snap = await snapshot();
-    const mem = await memoryFor(snap.containers);
+    const [mem, versions] = await Promise.all([memoryFor(snap.containers), versionsFor(snap.containers)]);
     return {
       snap,
       html:
@@ -739,7 +835,7 @@ async function livePart() {
         "<h2>Resource map</h2>" + resourceMap(snap, mem) +
         "<h2>Projects</h2>" +
         (snap.projects.length
-          ? snap.projects.map((p) => projectCard(p, mem)).join("")
+          ? snap.projects.map((p) => projectCard(p, mem, versions)).join("")
           : '<div class="glass empty">No containers of yours yet.</div>'),
     };
   } catch (error) {
@@ -925,7 +1021,7 @@ async function statusPage() {
       "</nav></header>",
     '<div id="live">' + html + "</div>",
     guides(snap),
-    "<footer>Read-only: this page only lists containers and reads their memory.</footer>",
+    "<footer>Read-only: this page only lists containers and reads their memory and version.</footer>",
     "</main>",
     "<script>" + SCRIPT + "</script>",
     "</body>",

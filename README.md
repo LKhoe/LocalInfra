@@ -370,7 +370,10 @@ It is one container: the stock `node:24-alpine` image running
 `localinfra-health/server.mjs.template`, non-root, read-only filesystem, no
 capabilities. It reads the Docker socket through the host's `docker` group (gid 987 on
 umbrelOS) and only calls `GET /containers/json` and, while the status page is open,
-`GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings. The only
+`GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings, and once
+per container `GET /containers/<id>/json` + `/archive` to read the `version` of the
+`package.json` in its working directory (images not tagged `:latest` show their tag instead,
+and an `org.opencontainers.image.version` label wins over both). The only
 other outbound requests fetch the icons of the apps' `localinfra.url` addresses.
 
 ### Install (once, in the Umbrel UI)

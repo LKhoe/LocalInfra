@@ -18,7 +18,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/server.mjs:/app/server.mjs:ro
       # Read-only use: server.mjs only calls GET /containers/json and, while the status
-      # page is open, GET /containers/<id>/stats (memory)
+      # page is open, GET /containers/<id>/stats (memory) and, once per container,
+      # GET /containers/<id>/json + /archive (the version in its package.json)
       - /var/run/docker.sock:/var/run/docker.sock:ro
     # Unprivileged: the node user plus the host's docker group (gid 987 on
     # umbrelOS) to read the socket. No root, no capabilities, read-only FS.
