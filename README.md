@@ -19,6 +19,7 @@ Projects don't run their own Postgres, Redis, file storage or LLM keys. They joi
 ```
 LocalInfra/
   compose.yml                   postgres + redis + s3 + llm + backup + tunnel
+  deploy.sh                     apply changes on the Pi (waits for healthy), or release Container Health
   .env.example                  copy to .env (secrets, backup path, schedule)
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
@@ -163,13 +164,17 @@ Overrides: `PI_SSH` (default `umbrel@umbrel.local`), `DOCKER_CONTEXT_NAME` (defa
 ## 3. Day-to-day
 
 ```bash
-DOCKER_CONTEXT=umbrel docker compose up -d --build     # apply changes (builds the two tiny images on the Pi)
+./deploy.sh                                           # apply changes on the Pi and wait until every service is healthy
+./deploy.sh llm                                       # only some services
 DOCKER_CONTEXT=umbrel docker compose ps
 DOCKER_CONTEXT=umbrel docker compose logs -f redis
 ```
 
 Only containers whose definition changed are recreated; projects using LocalInfra keep
-running.
+running. `deploy.sh` first checks the Docker context (and that its SSH alias doesn't share
+connections), that no bind mount points at the Mac (a `BACKUP_DIR=./backups-local` left in the
+shell), the branch and uncommitted changes; the bare
+`DOCKER_CONTEXT=umbrel docker compose up -d --build` still works.
 
 ## 4. Add a project
 
@@ -386,13 +391,15 @@ other outbound requests fetch the icons of the apps' `localinfra.url` addresses.
 ### Release a new version
 
 ```bash
-scripts/check-health-app.sh        # no "$" in the template, renders unchanged, valid JS
-# bump "version" in localinfra-health/umbrel-app.yml, commit, push
+# bump "version" in localinfra-health/umbrel-app.yml and commit, then:
+./deploy.sh --health
 ```
 
-umbrelOS checks community stores every 5 minutes; then open the app in the App Store
-and click **Update**. If a widget changed its format, reload the Umbrel page once: the
-dashboard keeps the last widget data in memory.
+It runs `scripts/check-health-app.sh` (no "$" in the template, renders unchanged, valid JS),
+refuses uncommitted changes in `localinfra-health/` or a change without a version bump, shows
+the commits and pushes `main` once you confirm. umbrelOS checks community stores every 5
+minutes; then open the app in the App Store and click **Update**. If a widget changed its
+format, reload the Umbrel page once: the dashboard keeps the last widget data in memory.
 
 Why the server is a `.template`: umbrelOS app updates only copy `docker-compose.yml`,
 `*.template`, `exports.sh`, `torrc`, `hooks` and `umbrel-app.yml`. Templates are rendered
@@ -437,7 +444,7 @@ ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 -
 - **Ports:** Postgres, Redis, the S3 API and the LLM gateway are published on the Pi's loopback only
   (`POSTGRES_PUBLISH` / `REDIS_PUBLISH` / `S3_PUBLISH` / `LLM_PUBLISH`); use the SSH tunnel above to reach
   them. Garage's RPC and admin ports are never published.
-- **Upgrading Ollama:** bump `OLLAMA_VERSION`, then `DOCKER_CONTEXT=umbrel docker compose up -d --build llm`.
+- **Upgrading Ollama:** bump `OLLAMA_VERSION`, then `./deploy.sh llm`.
   Another local model: set `LLM_LOCAL_MODEL` (any tag from ollama.com/library) and recreate `llm`.
-- **Upgrading Garage:** bump `GARAGE_VERSION`, then `DOCKER_CONTEXT=umbrel docker compose up -d --build s3`.
+- **Upgrading Garage:** bump `GARAGE_VERSION`, then `./deploy.sh s3`.
   Read the release notes first for major versions.
