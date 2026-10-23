@@ -523,6 +523,7 @@ const ICONS = {
   llm: '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1-5.1-1.9 5.1-1.9L12 3.5zM18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"/>',
   tunnel: '<path d="M7 18.5a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9a4.3 4.3 0 0 1-.4 9.5H7z"/>',
   google: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M12.5 12h7"/>',
+  alexa: '<path d="M6.4 17A7.5 7.5 0 1 1 9.3 19L4.5 19.5z"/><path d="M9.5 9.5a3.5 3.5 0 0 1 5 0"/>',
   out: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   copy: '<rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2.5"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
@@ -910,12 +911,46 @@ function guides(snap) {
     chip(null, "GOOGLE_CLIENT_ID") + " " + chip(null, "GOOGLE_CLIENT_SECRET") + " Then <kbd>./deploy.sh</kbd>.</li>" +
     "</ol></div></details>";
 
+  // Apps with a skill (sports-cal, brain-gym, my-recipes) answer it themselves: no Lambda, Alexa
+  // reaches them through the tunnel. The endpoint is /api/alexa, /api/alexa/skill in my-recipes.
+  // Details per app in alexa/README.md (my-recipes: README "Alexa skill").
+  const alexa =
+    '<details class="guide glass" style="--c: var(--neon)" id="guide-alexa">' +
+    '<summary><span class="gi">' + icon("alexa") + "</span><div><b>Connect an Alexa skill</b>" +
+    "<small>Create a custom skill that calls the app's own HTTPS endpoint</small></div>" + icon("chevron", "chev") + "</summary>" +
+    '<div class="gbody">' +
+    '<a class="btn" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Alexa Developer Console</a>" +
+    '<ol class="steps">' +
+    '<li class="warn" data-if="notunnel" hidden>This container is not on ' + chip(null, "localinfra_tunnel") +
+    ", so Alexa can't reach it. Publish it on Cloudflare first.</li>" +
+    '<li>The app must answer on its public address: follow <a href="#guide-cloudflare">Publish an app on Cloudflare</a> first.' +
+    '<span class="note">If Bot Fight Mode or a WAF rule is on for the zone, let the skill endpoint through: Alexa calls from AWS.</span></li>' +
+    "<li><b>Create Skill</b>: name, primary locale (the app's language, e.g. Portuguese (BR)), type <b>Other → Custom</b>, hosting <b>Provision your own</b>, template <b>Start from scratch</b>." +
+    '<span class="note">Apps with an alexa/ask-resources.json (sports-cal, brain-gym) can skip steps 2 to 5: <kbd>npx ask-cli deploy</kbd> from alexa/, after replacing SEU-DOMINIO in skill-package/skill.json.</span></li>' +
+    "<li><b>Endpoint</b> → HTTPS, Default Region " + chip("alexa", "https://myapp.example.com/api/alexa") +
+    '<span class="note">The path is the one in the app\'s skill.json: my-recipes uses /api/alexa/skill.</span>' +
+    "<span class=\"note\">SSL certificate type: <i>My development endpoint is a sub-domain of a domain that has a wildcard certificate from a certificate authority</i>, since Cloudflare's edge certificate is *.domain. " +
+    "With the trusted-CA option Alexa never calls the app (SKILL_ENDPOINT_ERROR in the Device Log).</span></li>" +
+    "<li><b>Interaction Model → JSON Editor</b>: paste " + chip(null, "skill-package/interactionModels/custom/<locale>.json") +
+    " then <b>Save</b> and <b>Build skill</b>." +
+    '<span class="note">Under alexa/ in sports-cal and brain-gym, at the root in my-recipes. Once per language the skill has (add them under Language settings). ' +
+    "Build again after any endpoint change: it only takes effect after a build.</span></li>" +
+    "<li>Turn on what the app's <kbd>skill.json</kbd> asks for: <b>Permissions</b> (Reminders, Timers) and <b>Interfaces</b> (Alexa Presentation Language, for Echo Show screens)." +
+    '<span class="note">The ASK CLI does this by itself.</span></li>' +
+    "<li>Copy the skill id (Alexa Skills list → <b>Copy Skill ID</b>) into the app's <kbd>.env</kbd> and run <kbd>./deploy.sh</kbd> " +
+    chip(null, "ALEXA_SKILL_ID=amzn1.ask.skill.") +
+    '<span class="note">The app then answers only this skill. Until it is set, sports-cal and my-recipes refuse every request.</span></li>' +
+    "<li><b>Test</b> tab → <i>Skill testing is enabled in</i> " + chip(null, "Development") +
+    '<span class="note">Any Echo signed in to the same Amazon account gets the skill too. It stays private unless submitted for certification. ' +
+    "Reminders or Timers must also be allowed once: in the Alexa app (Skills → Your Skills → Dev) or by voice when the Echo asks.</span></li>" +
+    "</ol></div></details>";
+
   return (
     '<div class="ghead"><h2>Guides</h2>' +
     '<label class="field"><span>App</span><select id="g-app">' + options + "</select></label>" +
     '<label class="field"><span>Domain</span><input id="g-domain" placeholder="example.com" spellcheck="false" autocomplete="off" value="' +
     escape(domain) + '"></label></div>' +
-    cloudflare + google
+    cloudflare + google + alexa
   );
 }
 
@@ -964,7 +999,7 @@ const SCRIPT = [
   "    d = d || 'example.com';",
   "    var origin = 'https://' + sub + '.' + d;",
   "    var v = { name: name, sub: sub, domain: d, svc: name + ':' + ((o && o.getAttribute('data-port')) || '3000'), origin: origin,",
-  "      redirect: origin + '/api/auth/callback/google', envurl: 'NEXT_PUBLIC_APP_URL=' + origin };",
+  "      redirect: origin + '/api/auth/callback/google', alexa: origin + '/api/alexa', envurl: 'NEXT_PUBLIC_APP_URL=' + origin };",
   "    document.querySelectorAll('[data-k]').forEach(function (el) {",
   "      var k = el.getAttribute('data-k'); el.textContent = v[k];",
   "      el.parentNode.classList.toggle('ph', !real && k !== 'name' && k !== 'svc' && k !== 'sub');",
@@ -990,6 +1025,8 @@ const SCRIPT = [
   "    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done, legacy); else legacy();",
   "  }",
   "  document.addEventListener('click', function (e) {",
+  "    var g = e.target.closest('a[href^=\"#guide-\"]'), to = g && document.querySelector(g.getAttribute('href'));",
+  "    if (to) to.open = true;",
   "    var b = e.target.closest('.cp'); if (!b) return;",
   "    copy(b.parentNode.querySelector('code'), function () {",
   "      b.classList.add('done'); setTimeout(function () { b.classList.remove('done'); }, 1400);",
@@ -1018,6 +1055,7 @@ async function statusPage() {
     '<nav class="links">' +
       '<a class="btn" style="--c: var(--tunnel)" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("tunnel") + "Cloudflare</a>" +
       '<a class="btn" style="--c: var(--postgres)" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + icon("google") + "Google Cloud</a>" +
+      '<a class="btn" style="--c: var(--neon)" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("alexa") + "Alexa</a>" +
       "</nav></header>",
     '<div id="live">' + html + "</div>",
     guides(snap),

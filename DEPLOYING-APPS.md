@@ -97,13 +97,16 @@ OAuth/API keys. Local-dev values go to `.env.local`, not `.env`.
 
 ### 3. Public access (once, manual)
 
-The Container Health page (Umbrel → Container Health → Open) has both as step-by-step guides,
+The Container Health page (Umbrel → Container Health → Open) has these as step-by-step guides,
 with the values for the app filled in and a copy button on each.
 
 - **Cloudflare Zero Trust → Networks → Tunnels** → the LocalInfra tunnel (`localinfra-tunnel`) → *Published application
   routes*: add the public hostname, service `HTTP`, URL `<app>:3000`.
 - **OAuth providers** (Google, ...): add `https://<hostname>/api/auth/callback/<provider>` as a
   redirect URI.
+- **Alexa skill** (optional): a custom skill whose HTTPS endpoint is the app itself, at the URI in
+  its `skill.json` (`/api/alexa`; `/api/alexa/skill` in my-recipes), with the *wildcard
+  certificate* option, then `ALEXA_SKILL_ID` in `.env`. Details in the app's README.
 
 ### 4. First deploy
 

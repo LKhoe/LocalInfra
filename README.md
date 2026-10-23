@@ -352,7 +352,7 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
   `/favicon.ico`), keeps it for 12 hours, and shows a globe while the app can't be reached.
 - **Projects**: every container with its status, resources, public address and memory
   (used / limit), LocalInfra included.
-- **Guides**: adding a Cloudflare tunnel route and a Google OAuth client, with the values for the
+- **Guides**: adding a Cloudflare tunnel route, a Google OAuth client and an Alexa skill, with the values for the
   chosen app and your domain filled in.
 
 The widgets:

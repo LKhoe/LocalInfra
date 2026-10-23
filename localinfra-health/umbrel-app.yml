@@ -2,7 +2,7 @@ manifestVersion: 1
 id: localinfra-health
 category: developer
 name: Container Health
-version: "1.2.6"
+version: "1.2.7"
 tagline: See at a glance whether the containers you run are healthy
 icon: https://raw.githubusercontent.com/LKhoe/LocalInfra/main/localinfra-health/icon.svg
 description: >-
@@ -15,15 +15,15 @@ description: >-
   The status page also maps which LocalInfra resources (Postgres, Redis, S3, the
   LLM gateway, the Cloudflare tunnel) each container uses, shows each container's
   memory and version, and has step-by-step guides for publishing an app on
-  Cloudflare and adding Google sign-in.
+  Cloudflare, adding Google sign-in and connecting an Alexa skill.
 
 
   To hide a one-off container, give it the label localinfra.health.hide=true.
   The app only reads from Docker (the container list, memory readings and each
   app's package.json version); it never changes anything.
 releaseNotes: >-
-  The project list shows each app's version: its package.json version for apps deployed
-  with deploy.sh, otherwise the image's version label or tag (postgres 17-alpine, Garage v2.4.1...).
+  New guide on the status page: connecting an Alexa skill to an app's own HTTPS endpoint,
+  with the app's public address filled in.
 developer: LKhoe
 website: https://github.com/LKhoe/LocalInfra
 repo: https://github.com/LKhoe/LocalInfra
