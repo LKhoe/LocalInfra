@@ -2,7 +2,7 @@ manifestVersion: 1
 id: localinfra-health
 category: developer
 name: Container Health
-version: "1.2.8"
+version: "1.2.9"
 tagline: See at a glance whether the containers you run are healthy
 icon: https://raw.githubusercontent.com/LKhoe/LocalInfra/main/localinfra-health/icon.svg
 description: >-
@@ -24,10 +24,8 @@ description: >-
   The app only reads from Docker (the container list, memory readings and each
   app's package.json version); it never changes anything.
 releaseNotes: >-
-  New Integrations section on the status page: what each app connects to (Google sign-in,
-  Alexa skills with Echo Show screens, Spotify, YouTube Music, Apple, Last.fm, Web Push,
-  SerpApi), with the env keys and OAuth redirect URIs. The Alexa guide now shows the picked
-  app's skill, screens and permissions, and fills in its own endpoint path.
+  The Integrations section on the status page starts collapsed: one row per app with an icon
+  per integration, expanded with a click.
 developer: LKhoe
 website: https://github.com/LKhoe/LocalInfra
 repo: https://github.com/LKhoe/LocalInfra
