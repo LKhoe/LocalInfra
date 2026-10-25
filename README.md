@@ -357,8 +357,13 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
   `/favicon.ico`), keeps it for 12 hours, and shows a globe while the app can't be reached.
 - **Projects**: every container with its status, resources, public address and memory
   (used / limit), LocalInfra included.
+- **Integrations**: what each app connects to outside LocalInfra (Google sign-in, Alexa skills with
+  Echo Show screens, Spotify, YouTube Music, Apple, Last.fm, Web Push, SerpApi, data sources), with
+  the env keys and OAuth redirect URIs. It's a list kept in `server.mjs.template` (`INTEGRATIONS`,
+  `ALEXA_SKILLS`): update it when an app gains or drops one. The page never reads an app's
+  environment, so it can't tell which keys are set.
 - **Guides**: adding a Cloudflare tunnel route, a Google OAuth client and an Alexa skill, with the values for the
-  chosen app and your domain filled in.
+  chosen app and your domain filled in (for Alexa: the app's endpoint path, Echo Show screens and permissions).
 
 The widgets:
 

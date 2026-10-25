@@ -524,6 +524,13 @@ const ICONS = {
   tunnel: '<path d="M7 18.5a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9a4.3 4.3 0 0 1-.4 9.5H7z"/>',
   google: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M12.5 12h7"/>',
   alexa: '<path d="M6.4 17A7.5 7.5 0 1 1 9.3 19L4.5 19.5z"/><path d="M9.5 9.5a3.5 3.5 0 0 1 5 0"/>',
+  screen: '<rect x="3" y="4.5" width="18" height="12" rx="2.5"/><path d="M8.5 20h7M12 16.5V20"/>',
+  music: '<path d="M9 17.5V5.5l10.5-2v12"/><circle cx="6.5" cy="17.5" r="2.5"/><circle cx="17" cy="15.5" r="2.5"/>',
+  play: '<rect x="3" y="5.5" width="18" height="13" rx="4"/><path d="m10.2 9.4 4.6 2.6-4.6 2.6z"/>',
+  user: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>',
+  bell: '<path d="M6.5 16v-5a5.5 5.5 0 0 1 11 0v5l1.5 2h-14zM10 20.5a2 2 0 0 0 4 0"/>',
+  search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.3-4.3"/>',
+  feed: '<path d="M5 19.5h.01M5 12.5a7 7 0 0 1 7 7M5 5.5a14 14 0 0 1 14 14"/>',
   out: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
   copy: '<rect x="8.5" y="8.5" width="11.5" height="11.5" rx="2.5"/><path d="M15.5 8.5V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2.5"/>',
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
@@ -553,6 +560,7 @@ const STYLE = [
   ":root { color-scheme: dark; --bg: #06060b; --text: #ececf4; --muted: rgba(236,236,244,.56); --faint: rgba(236,236,244,.3);",
   "  --line: rgba(255,255,255,.08); --ok: #4ade80; --warn: #fbbf24; --bad: #fb7185; --idle: #94a3b8;",
   "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --llm: #c084fc; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
+  "  --spotify: #1ed760; --youtube: #f87171; --apple: #cbd5e1; --lastfm: #f43f5e;",
   "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
   "* { box-sizing: border-box; }",
   "html { background: var(--bg); }",
@@ -686,6 +694,26 @@ const STYLE = [
   ".cp { display: grid; place-items: center; width: 26px; height: 26px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }",
   ".cp:hover, .cp:focus-visible { outline: none; color: var(--neon); background: rgba(34,211,238,.1); }",
   ".cp .ic { width: 15px; height: 15px; } .cp .ok { display: none; } .cp.done .cp-i { display: none; } .cp.done .ok { display: block; color: var(--ok); }",
+  ".gbody .app-note { margin: 0 0 12px; padding: 12px 14px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--c) 30%, transparent);",
+  "  background: color-mix(in srgb, var(--c) 7%, transparent); line-height: 1.7; }",
+  ".app-note[hidden] { display: none; } .app-note b { font-weight: 600; } .app-note ul { margin: 4px 0 0; padding-left: 18px; }",
+
+  // integrations
+  ".intg { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }",
+  ".icard { padding: 4px 16px 6px; min-width: 0; }",
+  ".icard .proj-h { gap: 10px; } .icard .proj-h .url { margin-left: auto; }",
+  ".icard .fav { margin-left: 0; }",
+  ".irow { display: flex; gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); min-width: 0; }",
+  ".irow .gi { width: 30px; height: 30px; border-radius: 10px; box-shadow: 0 0 18px -7px var(--c); }",
+  ".irow .gi .ic { width: 16px; height: 16px; }",
+  ".irow > div { min-width: 0; flex: 1; }",
+  ".irow b { font-weight: 500; } .irow .tag { display: inline-block; margin-left: 6px; vertical-align: 1px; white-space: nowrap; }",
+  ".irow p { margin: 1px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }",
+  ".irow .env { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; font-size: 12px; }",
+  ".irow .env code { font: 11px/1.6 var(--mono); padding: 0 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.04); overflow-wrap: anywhere; }",
+  ".irow .env a { color: var(--neon); text-decoration: none; display: inline-flex; align-items: center; gap: 3px; }",
+  ".irow .env a .ic { width: 12px; height: 12px; } .irow .env a:hover, .irow .env a:focus-visible { text-decoration: underline; outline: none; }",
+  ".intg-note { color: var(--faint); font-size: 12px; margin: 8px 4px 0; }",
   "kbd { font: 12px var(--mono); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.05); }",
   "footer { margin-top: 28px; text-align: center; color: var(--faint); font-size: 12px; }",
 
@@ -699,6 +727,7 @@ const STYLE = [
   "  .nm { flex-wrap: wrap; gap: 1px 8px; } .nm b { flex: 0 1 auto; max-width: 100%; } .nm .url { flex-basis: 100%; }",
   "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
   "  .mem em { display: none; } .steps li { line-height: 1.7; }",
+  "  .intg { grid-template-columns: minmax(0, 1fr); } .icard .proj-h .url { display: none; }",
   "}",
   "@media (prefers-reduced-motion: reduce) { svg.edges path.flow, .beat { animation: none; } }",
 ].join("\n");
@@ -848,6 +877,131 @@ const chip = (key, fallback) =>
   '<span class="chip' + (key ? '" data-chip="' + key : "") + '"><code' + (key ? ' data-k="' + key + '"' : "") + ">" + escape(fallback) + "</code>" +
   '<button type="button" class="cp" title="Copy" aria-label="Copy">' + icon("copy", "cp-i") + icon("check", "ok") + "</button></span>";
 
+// ---------------------------------------------------------------- integrations
+// What each app talks to outside LocalInfra, by container name, from the apps' own READMEs.
+// The page never reads a container's environment, so it shows what an app supports, not
+// which keys are set. "callback" is the OAuth redirect path, shown with the app's address.
+
+const GOOGLE_SIGNIN = {
+  icon: "google", c: "postgres", name: "Google sign-in", tags: ["Sign-in"], guide: "google",
+  env: ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"], callback: "/api/auth/callback/google",
+};
+
+const INTEGRATIONS = {
+  "yarg-aggregator": [
+    { ...GOOGLE_SIGNIN, name: "Google sign-in + YouTube Music", tags: ["Sign-in", "Import"],
+      what: "The youtube.readonly scope lets members import their YouTube Music playlists. Turn on YouTube Data API v3 in the same Cloud project." },
+    { icon: "music", c: "spotify", name: "Spotify", tags: ["Sign-in", "Import"],
+      what: "Sign-in, then import of the member's playlists and saved tracks; public playlist URLs and song links use the same app credentials.",
+      env: ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"], callback: "/api/auth/callback/spotify",
+      link: ["https://developer.spotify.com/dashboard", "Spotify dashboard"] },
+    { icon: "play", c: "youtube", name: "YouTube Music", tags: ["Import"],
+      what: "Public YouTube Music and YouTube playlist URLs, matched against the chart library, and YouTube song links.",
+      env: ["YOUTUBE_API_KEY"], link: ["https://console.cloud.google.com/apis/library/youtube.googleapis.com", "YouTube Data API"] },
+    { icon: "user", c: "apple", name: "Apple", tags: ["Sign-in", "Import"],
+      what: "Optional Sign in with Apple (Service ID + Auth key) and Apple Music library import (a separate MusicKit key).",
+      env: ["APPLE_CLIENT_ID", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_MUSIC_KEY_ID", "APPLE_MUSIC_PRIVATE_KEY"],
+      callback: "/api/auth/callback/apple", link: ["https://developer.apple.com/account/resources/identifiers/list/serviceId", "Apple Developer"] },
+    { icon: "music", c: "lastfm", name: "Last.fm", tags: ["Sign-in", "Import"],
+      what: "Sign-in and import; only offered when both keys are set.",
+      env: ["LASTFM_API_KEY", "LASTFM_API_SECRET"], link: ["https://www.last.fm/api/account/create", "Last.fm API account"] },
+    { icon: "feed", c: "tunnel", name: "Enchor.us + Rhythmverse", tags: ["Data"],
+      what: "The chart listings, fetched from Admin → Providers with their rate limits respected. Song links also use Deezer (no key) and SoundCloud (SOUNDCLOUD_CLIENT_ID)." },
+  ],
+  "my-recipes": [
+    GOOGLE_SIGNIN,
+    { icon: "alexa", c: "neon", name: "Alexa · Minhas Receitas", tags: ["Alexa", "Echo Show"], guide: "alexa",
+      what: "Pick a recipe by voice or touch, ingredients on screen, substitutes, then step by step with device timers. Same step as the web cook mode.",
+      env: ["ALEXA_SKILL_ID"] },
+    { icon: "play", c: "youtube", name: "YouTube", tags: ["Import"],
+      what: "Recipe import from videos (transcripts need no key) and saved playlists; the key reads descriptions and lists playlists.",
+      env: ["YOUTUBE_API_KEY"], link: ["https://console.cloud.google.com/apis/library/youtube.googleapis.com", "YouTube Data API"] },
+  ],
+  "sports-cal": [
+    { ...GOOGLE_SIGNIN, what: "ALLOWED_EMAILS decides who may create an account, by e-mail or Google." },
+    { icon: "alexa", c: "neon", name: "Alexa · Radar Esportivo", tags: ["Alexa", "Echo Show"], guide: "alexa",
+      what: "The admin's agenda, results, standings and where to watch by voice; reminders before kick-off and Echo notifications (match alert, goal, final score), set in /admin.",
+      env: ["ALEXA_SKILL_ID", "ALEXA_CLIENT_ID", "ALEXA_CLIENT_SECRET"] },
+    { icon: "bell", c: "warn", name: "Web Push", tags: ["Push"],
+      what: "Phone and desktop notifications before kick-off and with the final score. Needs the public HTTPS address; new keys drop every subscription.",
+      env: ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "VAPID_SUBJECT"] },
+    { icon: "search", c: "s3", name: "SerpApi", tags: ["Paid API"],
+      what: "Optional Google results in search and where-to-watch lookups, cached; the Alexa skill never calls it.",
+      env: ["SERPAPI_API_KEY"], link: ["https://serpapi.com/manage-api-key", "SerpApi"] },
+    { icon: "feed", c: "tunnel", name: "ESPN, CBV, LoL Esports, Wikidata", tags: ["Data"],
+      what: "Public sources, no key (LOLESPORTS_API_KEY only if Riot rotates the site's key), re-synced by the 2-minute scheduler." },
+  ],
+  "brain-gym": [
+    { icon: "alexa", c: "neon", name: "Alexa · Treino do Cérebro / Brain Gym", tags: ["Alexa", "Echo Show"], guide: "alexa",
+      what: "Mundi and Craque by voice, pt-BR and en-US. No accounts: game state lives in the browser and in the Alexa session.",
+      env: ["ALEXA_SKILL_ID", "PUBLIC_URL"] },
+  ],
+};
+
+// The Alexa guide's per-app box. Every skill here draws its own Echo Show screens (APL).
+const ALEXA_SKILLS = {
+  "sports-cal": {
+    skill: "Radar Esportivo", locales: "Portuguese (BR)", path: "/api/alexa", files: "alexa/skill-package/",
+    permissions: "Reminders, and Notifications with the events in skill.json (Alexa Skill Messaging gives ALEXA_CLIENT_ID / ALEXA_CLIENT_SECRET).",
+    screen: "Match cards with both logos, score and where to watch, the standings table and the follows. The opening shows Hoje, Resultados de ontem and Amanhã.",
+    voice: "With a screen it speaks only the gist and leaves the list to the screen. The Silenciar button (top right) mutes that device: answers are only shown.",
+    after: "In the Alexa app, turn on the skill's notifications (Mais → Configurações → Notificações → Radar Esportivo).",
+  },
+  "brain-gym": {
+    skill: "Treino do Cérebro / Brain Gym", locales: "Portuguese (BR) and English (US)", path: "/api/alexa", files: "alexa/skill-package/",
+    permissions: "None.",
+    screen: "Drawn at 1920×1080 for the Echo Show 15 and scaled down for smaller Shows: game cards, the Mundi world map with every guess, Craque's A–D buttons.",
+    voice: "With a screen Craque reads only the question. The speaker button (or \"modo silencioso\") stops speech for the session.",
+    after: "Set PUBLIC_URL in .env: the screens load the map package from it. Until ALEXA_SKILL_ID is set the app answers any skill.",
+  },
+  "my-recipes": {
+    skill: "Minhas Receitas", locales: "Portuguese (BR)", path: "/api/alexa/skill", files: "skill-package/ (at the repo root)",
+    permissions: "Timers.",
+    screen: "A start screen with a search box, up to ten matches to pick by voice or touch, the ingredients, then step by step.",
+    voice: "Silenciar on any screen turns the voice off until Ativar voz: answers then only appear on screen.",
+    after: "Allow Timers once: in the Alexa app (Suas skills → Desenvolvedor) or by voice when the Echo asks.",
+  },
+};
+
+function integrationRow(it, origin) {
+  const tags = it.tags.map((t) => '<span class="rc tag" style="--c: var(--' + it.c + ')">' + escape(t) + "</span>").join("");
+  const env = (it.env || []).map((e) => "<code>" + escape(e) + "</code>").join("");
+  const callback = it.callback && origin ? "<code title=\"OAuth redirect URI\">" + escape(origin + it.callback) + "</code>" : "";
+  const link = it.guide
+    ? '<a href="#guide-' + it.guide + '">Guide</a>'
+    : it.link
+      ? '<a href="' + escape(it.link[0]) + '" target="_blank" rel="noopener noreferrer">' + escape(it.link[1]) + icon("out") + "</a>"
+      : "";
+  const extra = env || callback || link;
+  return (
+    '<li class="irow"><span class="gi" style="--c: var(--' + it.c + ')">' + icon(it.icon) + "</span><div>" +
+    "<b>" + escape(it.name) + "</b>" + tags + (it.what ? "<p>" + escape(it.what) + "</p>" : "") +
+    (extra ? '<div class="env">' + env + callback + link + "</div>" : "") + "</div></li>"
+  );
+}
+
+function integrations(snap) {
+  const byName = new Map((snap ? snap.containers : []).map((c) => [c.name, c]));
+  const cards = Object.keys(INTEGRATIONS)
+    .sort()
+    .map((name) => {
+      const c = byName.get(name);
+      const href = c && c.url && publicUrl(c.url);
+      const origin = href ? new URL(href).origin : null;
+      return (
+        '<section class="icard glass"><div class="proj-h">' + (c ? appIcon(c) : "") + "<h3>" + escape(name) + "</h3>" +
+        (c ? appLink(c, "url") : '<span class="n">not running here</span>') + "</div>" +
+        '<ul class="rows">' + INTEGRATIONS[name].map((it) => integrationRow(it, origin)).join("") + "</ul></section>"
+      );
+    })
+    .join("");
+  return (
+    "<h2>Integrations</h2>" +
+    '<div class="intg">' + cards + "</div>" +
+    '<p class="intg-note">What each app supports, from its README. The keys go in the app\'s .env, never here: this page can\'t tell which ones are set.</p>'
+  );
+}
+
 function guides(snap) {
   const apps = (snap ? snap.containers : []).filter((c) => c.project !== "localinfra" && !RESOURCES.some((r) => r.provider === c.name));
   // Suggest the domain the published apps already use
@@ -865,7 +1019,8 @@ function guides(snap) {
           const host = c.url && hostname(c.url);
           return (
             '<option value="' + escape(c.name) + '" data-port="' + c.port + '" data-tunnel="' + (c.uses.includes("tunnel") ? 1 : 0) + '"' +
-            (host ? ' data-sub="' + escape(host.split(".")[0]) + '"' : "") + ">" + escape(c.name) + "</option>"
+            (host ? ' data-sub="' + escape(host.split(".")[0]) + '"' : "") +
+            (ALEXA_SKILLS[c.name] ? ' data-alexa="' + escape(ALEXA_SKILLS[c.name].path) + '"' : "") + ">" + escape(c.name) + "</option>"
           );
         })
         .join("")
@@ -911,37 +1066,56 @@ function guides(snap) {
     chip(null, "GOOGLE_CLIENT_ID") + " " + chip(null, "GOOGLE_CLIENT_SECRET") + " Then <kbd>./deploy.sh</kbd>.</li>" +
     "</ol></div></details>";
 
-  // Apps with a skill (sports-cal, brain-gym, my-recipes) answer it themselves: no Lambda, Alexa
-  // reaches them through the tunnel. The endpoint is /api/alexa, /api/alexa/skill in my-recipes.
-  // Details per app in alexa/README.md (my-recipes: README "Alexa skill").
+  // Apps with a skill (ALEXA_SKILLS) answer it themselves: no Lambda, Alexa reaches them through
+  // the tunnel, and each one draws its own Echo Show screens with APL. The box above the steps
+  // follows the app picked at the top. Details per app in alexa/README.md (my-recipes: README).
+  const skillNotes =
+    Object.entries(ALEXA_SKILLS)
+      .map(
+        ([name, s]) =>
+          '<div class="app-note" data-for="' + escape(name) + '" hidden><b>' + escape(name) + "</b> → skill <b>" + escape(s.skill) + "</b>, " +
+          escape(s.locales) + ", endpoint path <kbd>" + escape(s.path) + "</kbd>, model in <kbd>" + escape(s.files) + "</kbd><ul>" +
+          "<li><b>Echo Show</b>: " + escape(s.screen) + "</li>" +
+          "<li><b>Voice</b>: " + escape(s.voice) + "</li>" +
+          "<li><b>Permissions</b>: " + escape(s.permissions) + "</li>" +
+          "<li>" + escape(s.after) + "</li></ul></div>",
+      )
+      .join("") +
+    '<div class="app-note" data-for-none hidden>This app has no Alexa skill. The ones that do: ' + Object.keys(ALEXA_SKILLS).sort().join(", ") + ".</div>";
+
   const alexa =
     '<details class="guide glass" style="--c: var(--neon)" id="guide-alexa">' +
     '<summary><span class="gi">' + icon("alexa") + "</span><div><b>Connect an Alexa skill</b>" +
-    "<small>Create a custom skill that calls the app's own HTTPS endpoint</small></div>" + icon("chevron", "chev") + "</summary>" +
+    "<small>A custom skill that calls the app's own HTTPS endpoint and draws on Echo Show screens</small></div>" + icon("chevron", "chev") + "</summary>" +
     '<div class="gbody">' +
     '<a class="btn" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Alexa Developer Console</a>" +
+    skillNotes +
     '<ol class="steps">' +
     '<li class="warn" data-if="notunnel" hidden>This container is not on ' + chip(null, "localinfra_tunnel") +
     ", so Alexa can't reach it. Publish it on Cloudflare first.</li>" +
     '<li>The app must answer on its public address: follow <a href="#guide-cloudflare">Publish an app on Cloudflare</a> first.' +
     '<span class="note">If Bot Fight Mode or a WAF rule is on for the zone, let the skill endpoint through: Alexa calls from AWS.</span></li>' +
     "<li><b>Create Skill</b>: name, primary locale (the app's language, e.g. Portuguese (BR)), type <b>Other → Custom</b>, hosting <b>Provision your own</b>, template <b>Start from scratch</b>." +
-    '<span class="note">Apps with an alexa/ask-resources.json (sports-cal, brain-gym) can skip steps 2 to 5: <kbd>npx ask-cli deploy</kbd> from alexa/, after replacing SEU-DOMINIO in skill-package/skill.json.</span></li>' +
+    '<span class="note">Apps with an alexa/ask-resources.json (sports-cal, brain-gym) can skip steps 2 to 6: <kbd>npx ask-cli deploy</kbd> from alexa/, after replacing SEU-DOMINIO in skill-package/skill.json.</span></li>' +
     "<li><b>Endpoint</b> → HTTPS, Default Region " + chip("alexa", "https://myapp.example.com/api/alexa") +
-    '<span class="note">The path is the one in the app\'s skill.json: my-recipes uses /api/alexa/skill.</span>' +
+    '<span class="note">The path is the one in the app\'s skill.json (filled in for the app picked above).</span>' +
     "<span class=\"note\">SSL certificate type: <i>My development endpoint is a sub-domain of a domain that has a wildcard certificate from a certificate authority</i>, since Cloudflare's edge certificate is *.domain. " +
     "With the trusted-CA option Alexa never calls the app (SKILL_ENDPOINT_ERROR in the Device Log).</span></li>" +
     "<li><b>Interaction Model → JSON Editor</b>: paste " + chip(null, "skill-package/interactionModels/custom/<locale>.json") +
     " then <b>Save</b> and <b>Build skill</b>." +
     '<span class="note">Under alexa/ in sports-cal and brain-gym, at the root in my-recipes. Once per language the skill has (add them under Language settings). ' +
     "Build again after any endpoint change: it only takes effect after a build.</span></li>" +
-    "<li>Turn on what the app's <kbd>skill.json</kbd> asks for: <b>Permissions</b> (Reminders, Timers) and <b>Interfaces</b> (Alexa Presentation Language, for Echo Show screens)." +
-    '<span class="note">The ASK CLI does this by itself.</span></li>' +
+    "<li><b>Interfaces</b> → turn on <b>Alexa Presentation Language</b>, Save, then <b>Build skill</b> again." +
+    '<span class="note">This is what puts the skill on the screen: without it Alexa never tells the app the device has one, and an Echo Show only shows the spoken text. ' +
+    "Devices without a screen keep getting the full spoken answers.</span></li>" +
+    "<li><b>Permissions</b>: the ones the app's <kbd>skill.json</kbd> lists (in the box above: Reminders, Notifications, Timers)." +
+    '<span class="note">The ASK CLI turns on interfaces and permissions by itself.</span></li>' +
     "<li>Copy the skill id (Alexa Skills list → <b>Copy Skill ID</b>) into the app's <kbd>.env</kbd> and run <kbd>./deploy.sh</kbd> " +
     chip(null, "ALEXA_SKILL_ID=amzn1.ask.skill.") +
     '<span class="note">The app then answers only this skill. Until it is set, sports-cal and my-recipes refuse every request.</span></li>' +
     "<li><b>Test</b> tab → <i>Skill testing is enabled in</i> " + chip(null, "Development") +
-    '<span class="note">Any Echo signed in to the same Amazon account gets the skill too. It stays private unless submitted for certification. ' +
+    '<span class="note">Tick <b>Device Display</b> in the simulator to see the screens, then try it on an Echo Show: the screen stays up while the skill is open, and its mute button silences that device. ' +
+    "Any Echo signed in to the same Amazon account gets the skill too. It stays private unless submitted for certification. " +
     "Reminders or Timers must also be allowed once: in the Alexa app (Skills → Your Skills → Dev) or by voice when the Echo asks.</span></li>" +
     "</ol></div></details>";
 
@@ -999,12 +1173,16 @@ const SCRIPT = [
   "    d = d || 'example.com';",
   "    var origin = 'https://' + sub + '.' + d;",
   "    var v = { name: name, sub: sub, domain: d, svc: name + ':' + ((o && o.getAttribute('data-port')) || '3000'), origin: origin,",
-  "      redirect: origin + '/api/auth/callback/google', alexa: origin + '/api/alexa', envurl: 'NEXT_PUBLIC_APP_URL=' + origin };",
+  "      redirect: origin + '/api/auth/callback/google', alexa: origin + ((o && o.getAttribute('data-alexa')) || '/api/alexa'),",
+  "      envurl: 'NEXT_PUBLIC_APP_URL=' + origin };",
   "    document.querySelectorAll('[data-k]').forEach(function (el) {",
   "      var k = el.getAttribute('data-k'); el.textContent = v[k];",
   "      el.parentNode.classList.toggle('ph', !real && k !== 'name' && k !== 'svc' && k !== 'sub');",
   "    });",
   "    document.querySelectorAll('[data-if=\"notunnel\"]').forEach(function (el) { el.hidden = !o || o.getAttribute('data-tunnel') === '1'; });",
+  "    var skill = false;",
+  "    document.querySelectorAll('[data-for]').forEach(function (el) { el.hidden = el.getAttribute('data-for') !== name; skill = skill || !el.hidden; });",
+  "    document.querySelectorAll('[data-for-none]').forEach(function (el) { el.hidden = skill; });",
   "  }",
   "  app.addEventListener('change', function () { save('lih.app', app.value); fill(); });",
   "  dom.addEventListener('input', function () { save('lih.domain', dom.value.trim()); fill(); });",
@@ -1058,6 +1236,7 @@ async function statusPage() {
       '<a class="btn" style="--c: var(--neon)" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("alexa") + "Alexa</a>" +
       "</nav></header>",
     '<div id="live">' + html + "</div>",
+    integrations(snap),
     guides(snap),
     "<footer>Read-only: this page only lists containers and reads their memory and version.</footer>",
     "</main>",
