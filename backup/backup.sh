@@ -13,9 +13,15 @@ KEEP_MONTHS="${BACKUP_KEEP_MONTHS:-6}"
 
 log() { echo "[backup $(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+STATUS_JOB=postgres
+. /usr/local/lib/backup-status.sh
+TMP=""
+trap 'rc=$?; [ -z "$TMP" ] || rm -rf "$TMP"; write_status "$rc"; exit "$rc"' EXIT
+
 # If the external drive is not mounted, Docker silently creates an empty folder on
 # the SD card / system disk instead. The marker file only exists on the real drive.
 if [ ! -f "$MARKER" ]; then
+  STATUS_ERROR="external drive not mounted (no .localinfra-backup-target in the backup folder)"
   log "ERROR: $MARKER not found - is the external drive mounted? Not writing anything."
   exit 1
 fi
@@ -30,21 +36,25 @@ DEST="$DAILY/$STAMP"
 mkdir -p "$DAILY" "$MONTHLY"
 rm -rf "$TMP"
 mkdir -p "$TMP"
-trap 'rm -rf "$TMP"' EXIT
 
+STATUS_STEP="dumping roles"
 log "dumping roles"
 pg_dumpall --globals-only --file="$TMP/globals.sql"
 
+STATUS_STEP="listing the databases"
 dbs=$(psql -X -d postgres -Atc \
   "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY 1")
 
 for db in $dbs; do
+  STATUS_STEP="dumping $db"
   log "dumping $db"
   pg_dump --format=custom --dbname="$db" --file="$TMP/$db.dump"
 done
 
+STATUS_STEP="moving the set into place"
 rm -rf "$DEST"
 mv "$TMP" "$DEST"
+TMP=""
 
 if [ "$(date +%d)" = "01" ]; then
   rm -rf "$MONTHLY/$STAMP"
@@ -52,8 +62,10 @@ if [ "$(date +%d)" = "01" ]; then
   log "monthly copy kept: $MONTHLY/$STAMP"
 fi
 
+STATUS_STEP="pruning old sets"
 find "$DAILY" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_DAYS" -exec rm -rf {} +
 find "$MONTHLY" -mindepth 1 -maxdepth 1 -type d -mtime +"$((KEEP_MONTHS * 31))" -exec rm -rf {} +
 
 date '+%Y-%m-%dT%H:%M:%S%z' > "$ROOT/postgres/last_success"
+STATUS_SET="daily/$STAMP"
 log "done: $DEST ($(du -sh "$DEST" | cut -f1), databases: $(echo $dbs | tr ' ' ','))"

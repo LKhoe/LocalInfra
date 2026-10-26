@@ -36,6 +36,17 @@ const SITE_ICON_MAX_BYTES = 256 * 1024;
 // Version label an image can set (docker build --label / LABEL in the Dockerfile)
 const VERSION_LABEL = "org.opencontainers.image.version";
 const PACKAGE_JSON_MAX_BYTES = 256 * 1024;
+// LocalInfra's own compose project: its helpers (the backup joins localinfra_postgres to dump
+// it) are infrastructure, not apps, so the resource map leaves them out
+const LOCALINFRA_PROJECT = "localinfra";
+// The nightly backup container; its scripts write their results as JSON (backup/status.sh)
+const BACKUP_CONTAINER = process.env.BACKUP_CONTAINER || "localinfra-backup";
+const BACKUP_TTL_MS = 60 * 1000;
+// Same window as the backup container's healthcheck
+const BACKUP_STALE_MS = 26 * 3600 * 1000;
+// Newest release of the pinned images (UPDATE_CHECKS), looked up on Docker Hub
+const UPDATE_TTL_MS = 12 * 3600 * 1000;
+const UPDATE_RETRY_MS = 3600 * 1000;
 
 const STATES = {
   ok: { rank: 0, emoji: "✅", label: "Healthy" },
@@ -226,21 +237,27 @@ function firstTarFile(buf) {
   return null;
 }
 
-async function packageVersion(id) {
-  const info = await dockerGet("/containers/" + id + "/json");
-  const dir = info.Config?.WorkingDir;
-  if (!dir) return null;
-  const file = (dir.endsWith("/") ? dir : dir + "/") + "package.json";
+// One file of a container (running or not) through the read-only archive endpoint, like
+// docker cp; null when it doesn't exist
+async function containerFile(id, file, maxBytes) {
   let tar;
   try {
-    tar = await dockerRaw("/containers/" + id + "/archive?path=" + encodeURIComponent(file), PACKAGE_JSON_MAX_BYTES + 1024);
+    tar = await dockerRaw("/containers/" + id + "/archive?path=" + encodeURIComponent(file), maxBytes + 1024);
   } catch (error) {
     if (error.status === 404) return null;
     throw error;
   }
   const body = firstTarFile(tar);
+  return body ? body.toString("utf8") : null;
+}
+
+async function packageVersion(id) {
+  const info = await dockerGet("/containers/" + id + "/json");
+  const dir = info.Config?.WorkingDir;
+  if (!dir) return null;
+  const body = await containerFile(id, (dir.endsWith("/") ? dir : dir + "/") + "package.json", PACKAGE_JSON_MAX_BYTES);
   if (!body) return null;
-  const version = JSON.parse(body.toString("utf8")).version;
+  const version = JSON.parse(body).version;
   return typeof version === "string" && version ? version : null;
 }
 
@@ -271,6 +288,146 @@ async function versionsFor(containers) {
   }
   if (versionsPending) await versionsPending;
   return versionCache;
+}
+
+// ---------------------------------------------------------------- backups
+// What the nightly backup holds and how its last run went, from the JSON that backup/status.sh
+// writes inside localinfra-backup (read with containerFile, cached BACKUP_TTL_MS):
+//   /run/backup-status/<job>.json      the last run, good or not (gone after a restart)
+//   /backups/<job>/last_success.json   the last good run, with the files of its set
+//   /backups/<job>/last_success        the healthcheck's timestamp (older backup images only write this)
+// Never the container's environment: it holds the Postgres password.
+
+const BACKUP_JOBS = [
+  { key: "postgres", label: "Postgres", c: "postgres", what: "Roles and passwords (globals.sql) and one pg_dump per database, restored with pg_restore." },
+  { key: "homeassistant", label: "Home Assistant", c: "homeassistant", what: "A copy of Home Assistant's own newest backup (encrypted .tar, made daily at 03:30)." },
+];
+const BACKUP_FILE_MAX_BYTES = 64 * 1024;
+
+let backupCache = { at: 0, value: null, pending: null };
+
+const parseJson = (text) => {
+  try {
+    const value = text ? JSON.parse(text) : null;
+    return value && typeof value === "object" && typeof value.finished === "number" ? value : null;
+  } catch {
+    return null;
+  }
+};
+
+// "2026-10-26T04:00:12-0300" (date +%Y-%m-%dT%H:%M:%S%z) -> ms
+function stampMs(text) {
+  const m = (text || "").trim().match(/^([0-9-]+T[0-9:]+)([+-][0-9]{2}):?([0-9]{2})/);
+  const ms = m ? Date.parse(m[1] + m[2] + ":" + m[3]) : NaN;
+  return Number.isFinite(ms) ? ms : null;
+}
+
+async function backupJob(id, job) {
+  const read = (file) => containerFile(id, file, BACKUP_FILE_MAX_BYTES);
+  const [run, good, stamp] = await Promise.all([
+    read("/run/backup-status/" + job.key + ".json"),
+    read("/backups/" + job.key + "/last_success.json"),
+    read("/backups/" + job.key + "/last_success"),
+  ]);
+  const lastGood = parseJson(good);
+  const lastRun = [parseJson(run), lastGood].filter(Boolean).sort((a, b) => b.finished - a.finished)[0] || null;
+  const successAt = Math.max(lastGood ? lastGood.finished * 1000 : 0, stampMs(stamp) || 0) || null;
+  let state = "unknown";
+  if (lastRun && !lastRun.ok) state = "unhealthy";
+  else if (successAt) state = Date.now() - successAt < BACKUP_STALE_MS ? "ok" : "unhealthy";
+  return { ...job, lastRun, lastGood, successAt, state };
+}
+
+async function backups(snap) {
+  const c = snap.containers.find((x) => x.name === BACKUP_CONTAINER);
+  if (!c) return { container: null, jobs: [] };
+  if (backupCache.value && backupCache.value.container.id === c.id && Date.now() - backupCache.at < BACKUP_TTL_MS) return backupCache.value;
+  if (!backupCache.pending) {
+    backupCache.pending = Promise.all(BACKUP_JOBS.map((job) => backupJob(c.id, job).catch(() => ({ ...job, state: "unknown", error: true }))))
+      .then((jobs) => {
+        backupCache = { at: Date.now(), value: { container: c, jobs }, pending: null };
+        return backupCache.value;
+      })
+      .finally(() => (backupCache.pending = null));
+  }
+  return backupCache.pending;
+}
+
+// ---------------------------------------------------------------- updates
+// LocalInfra pins these images to a version in its .env. While a status page is open, the
+// server looks up the newest release tag on Docker Hub (at most every UPDATE_TTL_MS) and the
+// page suggests the update. Nothing is pulled or changed from here.
+
+const UPDATE_CHECKS = [
+  { container: "localinfra-tunnel", name: "cloudflared", repo: "cloudflare/cloudflared", env: "CLOUDFLARED_VERSION", service: "tunnel",
+    brand: "cloudflare", c: "tunnel", notes: "https://github.com/cloudflare/cloudflared/releases" },
+];
+
+// repo -> { at, ok, latest } or { pending, latest }
+const updateCache = new Map();
+
+// "2026.10.4" -> [2026, 10, 4]; null for "latest", build ids, "-arm64" suffixes...
+function releaseParts(tag) {
+  const m = /^[0-9]+(\.[0-9]+){1,3}/.exec(tag || "");
+  return m && m[0] === tag ? tag.split(".").map(Number) : null;
+}
+
+function isNewer(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
+
+// Docker's name for this machine's architecture (the Pi: arm64)
+const DOCKER_ARCH = { x64: "amd64", arm64: "arm64", arm: "arm" }[os.arch()] || os.arch();
+
+async function latestRelease(repo) {
+  const res = await fetch("https://hub.docker.com/v2/repositories/" + repo + "/tags?page_size=50&ordering=last_updated", {
+    signal: AbortSignal.timeout(5000),
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) throw new Error("Docker Hub " + res.status);
+  let best = null;
+  for (const t of (await res.json()).results || []) {
+    const parts = releaseParts(t.name);
+    // Only tags that have an image for this machine
+    if (!parts || (Array.isArray(t.images) && !t.images.some((i) => i.architecture === DOCKER_ARCH))) continue;
+    if (!best || isNewer(parts, best.parts)) best = { tag: t.name, parts };
+  }
+  return best ? best.tag : null;
+}
+
+function latestFor(repo) {
+  const hit = updateCache.get(repo);
+  if (hit && (hit.pending || Date.now() - hit.at < (hit.ok ? UPDATE_TTL_MS : UPDATE_RETRY_MS))) return hit;
+  const latest = hit ? hit.latest : null;
+  const pending = latestRelease(repo).then(
+    (tag) => updateCache.set(repo, { at: Date.now(), ok: true, latest: tag }),
+    () => updateCache.set(repo, { at: Date.now(), ok: false, latest }),
+  );
+  updateCache.set(repo, { pending, latest });
+  return updateCache.get(repo);
+}
+
+// container name -> { check, running, latest }, for the pinned images with a newer release.
+// Waits a moment for a lookup in flight, else the next refresh shows it.
+async function updatesFor(snap) {
+  const found = new Map();
+  for (const check of UPDATE_CHECKS) {
+    const c = snap.containers.find((x) => x.name === check.container);
+    const running = c && imageTag(c.image);
+    if (!running || !releaseParts(running)) continue;
+    let hit = latestFor(check.repo);
+    if (hit.pending) {
+      await Promise.race([hit.pending, new Promise((resolve) => setTimeout(resolve, 1500))]);
+      hit = updateCache.get(check.repo);
+    }
+    const latest = hit.latest && releaseParts(hit.latest);
+    if (latest && isNewer(latest, releaseParts(running))) found.set(c.name, { check, running, latest: hit.latest });
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------- app icons
@@ -473,6 +630,8 @@ const escape = (s) =>
 
 function bytes(n) {
   if (n == null) return "–";
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n / 1024).toFixed(n < 102400 ? 1 : 0) + " KiB";
   const mib = n / 1048576;
   if (mib >= 1024) return (mib / 1024).toFixed(1) + " GiB";
   return (mib >= 100 ? mib.toFixed(0) : mib.toFixed(1)) + " MiB";
@@ -522,12 +681,7 @@ const ICONS = {
   s3: '<path d="M4 6.5c0 1.4 3.6 2.5 8 2.5s8-1.1 8-2.5S16.4 4 12 4 4 5.1 4 6.5zm0 0 1.8 12c.2 1.4 2.9 2.3 6.2 2.3s6-.9 6.2-2.3L20 6.5"/>',
   llm: '<path d="M12 3.5l1.9 5.1 5.1 1.9-5.1 1.9L12 17.5l-1.9-5.1-5.1-1.9 5.1-1.9L12 3.5zM18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"/>',
   tunnel: '<path d="M7 18.5a4.5 4.5 0 0 1-.6-9A6 6 0 0 1 18 9a4.3 4.3 0 0 1-.4 9.5H7z"/>',
-  google: '<path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M12.5 12h7"/>',
-  alexa: '<path d="M6.4 17A7.5 7.5 0 1 1 9.3 19L4.5 19.5z"/><path d="M9.5 9.5a3.5 3.5 0 0 1 5 0"/>',
   screen: '<rect x="3" y="4.5" width="18" height="12" rx="2.5"/><path d="M8.5 20h7M12 16.5V20"/>',
-  music: '<path d="M9 17.5V5.5l10.5-2v12"/><circle cx="6.5" cy="17.5" r="2.5"/><circle cx="17" cy="15.5" r="2.5"/>',
-  play: '<rect x="3" y="5.5" width="18" height="13" rx="4"/><path d="m10.2 9.4 4.6 2.6-4.6 2.6z"/>',
-  user: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>',
   bell: '<path d="M6.5 16v-5a5.5 5.5 0 0 1 11 0v5l1.5 2h-14zM10 20.5a2 2 0 0 0 4 0"/>',
   search: '<circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.3-4.3"/>',
   feed: '<path d="M5 19.5h.01M5 12.5a7 7 0 0 1 7 7M5 5.5a14 14 0 0 1 14 14"/>',
@@ -536,6 +690,63 @@ const ICONS = {
   check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
   chevron: '<path d="m6 9 6 6 6-6"/>',
   pulse: '<path d="M3 12h4l2.5-6 5 12 2.5-6h4"/>',
+  up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+};
+
+// The real logos of the integrations, filled in their brand colours: [fill, d, extra attributes].
+// Paths from Simple Icons (CC0, simpleicons.org), split where a logo has more than one colour;
+// Alexa's ring is drawn here (Simple Icons has no Amazon marks).
+const BRANDS = {
+  google: [
+    ["#4285F4", "M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47c-.29 1.48-1.14 2.73-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z"],
+    ["#34A853", "M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09C3.26 21.3 7.31 24 12 24z"],
+    ["#FBBC05", "M5.27 14.29c-.25-.72-.38-1.49-.38-2.29s.14-1.57.38-2.29V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.98-3.09z"],
+    ["#EA4335", "M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.98 3.09c.95-2.85 3.6-4.96 6.73-4.96z"],
+  ],
+  googlecloud: [
+    ["#4285F4", "M12.19 2.38a9.344 9.344 0 0 0-9.234 6.893c.053-.02-.055.013 0 0-3.875 2.551-3.922 8.11-.247 10.941l.006-.007-.007.03a6.717 6.717 0 0 0 4.077 1.356h5.173l.03.03h5.192c6.687.053 9.376-8.605 3.835-12.35a9.365 9.365 0 0 0-2.821-4.552l-.043.043.006-.05A9.344 9.344 0 0 0 12.19 2.38zm-.358 4.146c1.244-.04 2.518.368 3.486 1.15a5.186 5.186 0 0 1 1.862 4.078v.518c3.53-.07 3.53 5.262 0 5.193h-5.193l-.008.009v-.04H6.785a2.59 2.59 0 0 1-1.067-.23h.001a2.597 2.597 0 1 1 3.437-3.437l3.013-3.012A6.747 6.747 0 0 0 8.11 8.24c.018-.01.04-.026.054-.023a5.186 5.186 0 0 1 3.67-1.69z"],
+  ],
+  alexa: [["#00CAFF", "M12 1a11 11 0 1 1-5.3 20.6L2 22.6l.9-4.7A11 11 0 0 1 12 1zm0 4a7 7 0 1 0 0 14 7 7 0 1 0 0-14z", ' fill-rule="evenodd"']],
+  cloudflare: [
+    ["#F38020", "M16.5088 16.8447c.1475-.5068.0908-.9707-.1553-1.3154-.2246-.3164-.6045-.499-1.0615-.5205l-8.6592-.1123a.1559.1559 0 0 1-.1333-.0713c-.0283-.042-.0351-.0986-.021-.1553.0278-.084.1123-.1484.2036-.1562l8.7359-.1123c1.0351-.0489 2.1601-.8868 2.5537-1.9136l.499-1.3013c.0215-.0561.0293-.1128.0147-.168-.5625-2.5463-2.835-4.4453-5.5499-4.4453-2.5039 0-4.6284 1.6177-5.3876 3.8614-.4927-.3658-1.1187-.5625-1.794-.499-1.2026.119-2.1665 1.083-2.2861 2.2856-.0283.31-.0069.6128.0635.894C1.5683 13.171 0 14.7754 0 16.752c0 .1748.0142.3515.0352.5273.0141.083.0844.1475.1689.1475h15.9814c.0909 0 .1758-.0645.2032-.1553l.12-.4268z"],
+    ["#FAAE40", "M19.2656 11.2813c-.0771 0-.1611 0-.2383.0112-.0566 0-.1054.0415-.127.0976l-.3378 1.1744c-.1475.5068-.0918.9707.1543 1.3164.2256.3164.6055.498 1.0625.5195l1.8437.1133c.0557 0 .1055.0263.1329.0703.0283.043.0351.1074.0214.1562-.0283.084-.1132.1485-.204.1553l-1.921.1123c-1.041.0488-2.1582.8867-2.5527 1.914l-.1406.3585c-.0283.0713.0215.1416.0986.1416h6.5977c.0771 0 .1474-.0489.169-.126.1122-.4082.1757-.837.1757-1.2803 0-2.6025-2.125-4.727-4.7344-4.727"],
+  ],
+  spotify: [
+    ["#1ED760", "M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"],
+  ],
+  youtube: [
+    ["#FF0000", "M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814z"],
+    ["#FFFFFF", "M9.545 15.568V8.432L15.818 12z"],
+  ],
+  youtubemusic: [
+    ["#FF0000", "M12 0a12 12 0 1 0 0 24 12 12 0 1 0 0-24z"],
+    ["#FFFFFF", "M12 4.896a7.104 7.104 0 1 0 0 14.208 7.104 7.104 0 1 0 0-14.208zm0 .876a6.228 6.228 0 1 1 0 12.456 6.228 6.228 0 1 1 0-12.456zM9.684 15.54V8.46L15.816 12z", ' fill-rule="evenodd"'],
+  ],
+  // Apple's mark is monochrome: light on this dark page
+  apple: [
+    ["#E5E7EB", "M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"],
+  ],
+  lastfm: [
+    ["#D51007", "M4 0h16a4 4 0 0 1 4 4v16a4 4 0 0 1-4 4H4a4 4 0 0 1-4-4V4a4 4 0 0 1 4-4z"],
+    ["#FFFFFF", "M10.584 17.21l-.88-2.392s-1.43 1.594-3.573 1.594c-1.897 0-3.244-1.649-3.244-4.288 0-3.382 1.704-4.591 3.381-4.591 2.42 0 3.189 1.567 3.849 3.574l.88 2.749c.88 2.666 2.529 4.81 7.285 4.81 3.409 0 5.718-1.044 5.718-3.793 0-2.227-1.265-3.381-3.63-3.931l-1.758-.385c-1.21-.275-1.567-.77-1.567-1.595 0-.934.742-1.484 1.952-1.484 1.32 0 2.034.495 2.144 1.677l2.749-.33c-.22-2.474-1.924-3.492-4.729-3.492-2.474 0-4.893.935-4.893 3.932 0 1.87.907 3.051 3.189 3.601l1.87.44c1.402.33 1.869.907 1.869 1.704 0 1.017-.99 1.43-2.86 1.43-2.776 0-3.93-1.457-4.59-3.464l-.907-2.75c-1.155-3.573-2.997-4.893-6.653-4.893C2.144 5.333 0 7.89 0 12.233c0 4.18 2.144 6.434 5.993 6.434 3.106 0 4.591-1.457 4.591-1.457z", ' transform="translate(3 3) scale(.75)"'],
+  ],
+  leagueoflegends: [
+    ["#C28F2C", "m1.912 0 1.212 2.474v19.053L1.912 24h14.73l1.337-4.682H8.33V0ZM12 1.516c-.913 0-1.798.112-2.648.312v1.74a9.738 9.738 0 0 1 2.648-.368c5.267 0 9.536 4.184 9.536 9.348a9.203 9.203 0 0 1-2.3 6.086l-.273.954-.602 2.112c2.952-1.993 4.89-5.335 4.89-9.122C23.25 6.468 18.213 1.516 12 1.516Zm0 2.673c-.924 0-1.814.148-2.648.414v13.713h8.817a8.246 8.246 0 0 0 2.36-5.768c0-4.617-3.818-8.359-8.529-8.359zM2.104 7.312A10.858 10.858 0 0 0 .75 12.576c0 1.906.492 3.7 1.355 5.266z"],
+  ],
+  wikidata: [
+    ["#990000", "M0 4.583v14.833h.865V4.583zm1.788 0v14.833h2.653V4.583zm3.518 0v14.832H7.96V4.583z"],
+    ["#339966", "M8.853 4.583v14.834h.866V4.583zm1.789 0v14.833h.865V4.583zm1.759 0v14.834h2.653V4.583z"],
+    ["#006699", "M15.919 4.583v14.834h.923V4.583zm1.788 0v14.833h2.653V4.583zm3.64 0v14.834h.865V4.583zm1.788 0v14.834H24V4.583z"],
+  ],
+  deezer: [
+    ["#A238FF", "M.693 10.024c.381 0 .693-1.256.693-2.807 0-1.55-.312-2.807-.693-2.807C.312 4.41 0 5.666 0 7.217s.312 2.808.693 2.808ZM21.038 1.56c-.364 0-.684.805-.91 2.096C19.765 1.446 19.184 0 18.526 0c-.78 0-1.464 2.036-1.784 5-.312-2.158-.788-3.536-1.325-3.536-.745 0-1.386 2.704-1.62 6.472-.442-1.932-1.083-3.145-1.793-3.145s-1.35 1.213-1.793 3.145c-.242-3.76-.874-6.463-1.628-6.463-.537 0-1.013 1.378-1.325 3.535C6.938 2.036 6.262 0 5.474 0c-.658 0-1.247 1.447-1.602 3.665-.217-1.291-.546-2.105-.91-2.105-.675 0-1.221 2.807-1.221 6.272 0 3.466.546 6.273 1.221 6.273.277 0 .537-.476.736-1.273.32 2.928.996 4.938 1.776 4.938.606 0 1.143-1.204 1.507-3.11.251 3.622.875 6.195 1.602 6.195.46 0 .875-1.023 1.187-2.677C10.142 21.6 11 24 12.004 24c1.005 0 1.863-2.4 2.235-5.822.312 1.654.727 2.677 1.186 2.677.728 0 1.352-2.573 1.603-6.195.364 1.906.9 3.11 1.507 3.11.78 0 1.455-2.01 1.775-4.938.208.797.46 1.273.737 1.273.675 0 1.22-2.807 1.22-6.273-.008-3.457-.553-6.272-1.23-6.272ZM23.307 10.024c.381 0 .693-1.256.693-2.807 0-1.55-.312-2.807-.693-2.807-.381 0-.693 1.256-.693 2.807s.312 2.808.693 2.808Z"],
+  ],
+  homeassistant: [
+    ["#18BCF2", "M22.939 10.627 13.061.749a1.505 1.505 0 0 0-2.121 0l-9.879 9.878C.478 11.21 0 12.363 0 13.187v9c0 .826.675 1.5 1.5 1.5h9.227l-4.063-4.062a2.034 2.034 0 0 1-.664.113c-1.13 0-2.05-.92-2.05-2.05s.92-2.05 2.05-2.05 2.05.92 2.05 2.05c0 .233-.041.456-.113.665l3.163 3.163V9.928a2.05 2.05 0 0 1-1.15-1.84c0-1.13.92-2.05 2.05-2.05s2.05.92 2.05 2.05a2.05 2.05 0 0 1-1.15 1.84v8.127l3.146-3.146A2.051 2.051 0 0 1 18 12.239c1.13 0 2.05.92 2.05 2.05s-.92 2.05-2.05 2.05c-.25 0-.488-.047-.709-.13L12.9 20.602v3.088h9.6c.825 0 1.5-.675 1.5-1.5v-9c0-.825-.477-1.977-1.061-2.561z"],
+  ],
+  soundcloud: [
+    ["#FF5500", "M23.999 14.165c-.052 1.796-1.612 3.169-3.4 3.169h-8.18a.68.68 0 0 1-.675-.683V7.862a.747.747 0 0 1 .452-.724s.75-.513 2.333-.513a5.364 5.364 0 0 1 2.763.755 5.433 5.433 0 0 1 2.57 3.54c.282-.08.574-.121.868-.12.884 0 1.73.358 2.347.992s.948 1.49.922 2.373ZM10.721 8.421c.247 2.98.427 5.697 0 8.672a.264.264 0 0 1-.53 0c-.395-2.946-.22-5.718 0-8.672a.264.264 0 0 1 .53 0ZM9.072 9.448c.285 2.659.37 4.986-.006 7.655a.277.277 0 0 1-.55 0c-.331-2.63-.256-5.02 0-7.655a.277.277 0 0 1 .556 0Zm-1.663-.257c.27 2.726.39 5.171 0 7.904a.266.266 0 0 1-.532 0c-.38-2.69-.257-5.21 0-7.904a.266.266 0 0 1 .532 0Zm-1.647.77a26.108 26.108 0 0 1-.008 7.147.272.272 0 0 1-.542 0 27.955 27.955 0 0 1 0-7.147.275.275 0 0 1 .55 0Zm-1.67 1.769c.421 1.865.228 3.5-.029 5.388a.257.257 0 0 1-.514 0c-.21-1.858-.398-3.549 0-5.389a.272.272 0 0 1 .543 0Zm-1.655-.273c.388 1.897.26 3.508-.01 5.412-.026.28-.514.283-.54 0-.244-1.878-.347-3.54-.01-5.412a.283.283 0 0 1 .56 0Zm-1.668.911c.4 1.268.257 2.292-.026 3.572a.257.257 0 0 1-.514 0c-.241-1.262-.354-2.312-.023-3.572a.283.283 0 0 1 .563 0Z"],
+  ],
 };
 // Browser tab icon: the header logo, a neon pulse on a dark glass tile
 const FAVICON = [
@@ -556,11 +767,18 @@ const icon = (name, cls) =>
   '<svg class="ic' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
   ICONS[name] + "</svg>";
 
+const brand = (name, cls) =>
+  '<svg class="ic brand' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24" aria-hidden="true">' +
+  BRANDS[name].map(([fill, d, extra]) => '<path fill="' + fill + '" d="' + d + '"' + (extra || "") + "/>").join("") + "</svg>";
+
+// A brand logo when there is one, else the stroke icon
+const mark = (name, cls) => (BRANDS[name] ? brand(name, cls) : icon(name, cls));
+
 const STYLE = [
   ":root { color-scheme: dark; --bg: #06060b; --text: #ececf4; --muted: rgba(236,236,244,.56); --faint: rgba(236,236,244,.3);",
   "  --line: rgba(255,255,255,.08); --ok: #4ade80; --warn: #fbbf24; --bad: #fb7185; --idle: #94a3b8;",
   "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --llm: #c084fc; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
-  "  --spotify: #1ed760; --youtube: #f87171; --apple: #cbd5e1; --lastfm: #f43f5e;",
+  "  --spotify: #1ed760; --youtube: #f87171; --apple: #cbd5e1; --lastfm: #f43f5e; --google: #4285f4; --alexa: #00caff; --homeassistant: #18bcf2;",
   "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
   "* { box-sizing: border-box; }",
   "html { background: var(--bg); }",
@@ -720,7 +938,32 @@ const STYLE = [
   ".irow .env code { font: 11px/1.6 var(--mono); padding: 0 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.04); overflow-wrap: anywhere; }",
   ".irow .env a { color: var(--neon); text-decoration: none; display: inline-flex; align-items: center; gap: 3px; }",
   ".irow .env a .ic { width: 12px; height: 12px; } .irow .env a:hover, .irow .env a:focus-visible { text-decoration: underline; outline: none; }",
+  ".irow .logos { display: inline-flex; gap: 5px; margin-left: 6px; vertical-align: -3px; } .irow .logos .ic { width: 15px; height: 15px; }",
   ".intg-note { color: var(--faint); font-size: 12px; margin: 8px 4px 0; }",
+
+  // updates
+  ".upd { display: flex; align-items: center; gap: 12px; margin-top: 10px; padding: 12px 16px; border-color: color-mix(in srgb, var(--c) 40%, transparent);",
+  "  box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 0 32px -14px var(--c); }",
+  ".upd > div { flex: 1; min-width: 0; } .upd b { font-weight: 600; } .upd small { color: var(--muted); font-size: 12px; margin-left: 6px; }",
+  ".upd p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.9; }",
+  ".upd .btn { flex: none; }",
+  "a.ver.new { color: var(--warn); border-color: rgba(251,191,36,.4); background: rgba(251,191,36,.08); text-decoration: none; }",
+  "a.ver.new:hover, a.ver.new:focus-visible { outline: none; box-shadow: 0 0 12px -3px var(--warn); }",
+
+  // backups
+  ".bks { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: start; }",
+  ".bk { padding: 14px 16px; min-width: 0; }",
+  ".bk-h { display: flex; align-items: center; gap: 10px; min-width: 0; }",
+  ".bk-h .gi { width: 30px; height: 30px; border-radius: 10px; box-shadow: 0 0 18px -7px var(--c); } .bk-h .gi .ic { width: 16px; height: 16px; }",
+  ".bk-h b { font-size: 14.5px; font-weight: 600; } .bk-h .n { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }",
+  ".bk .what { margin: 8px 0 10px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }",
+  ".kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; margin: 0; font-size: 12.5px; }",
+  ".kv dt { color: var(--muted); } .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }",
+  ".kv .good { color: var(--ok); } .kv .bad { color: var(--bad); }",
+  ".files { list-style: none; display: flex; flex-wrap: wrap; gap: 5px; margin: 12px 0 0; padding: 0; }",
+  ".files li { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px/1.7 var(--mono); padding: 0 7px; border-radius: 7px;",
+  "  border: 1px solid var(--line); background: rgba(255,255,255,.04); } .files li em { font-style: normal; color: var(--faint); margin-left: 6px; }",
+  ".bk .foot { display: block; margin-top: 10px; color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }",
   "kbd { font: 12px var(--mono); padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); background: rgba(255,255,255,.05); }",
   "footer { margin-top: 28px; text-align: center; color: var(--faint); font-size: 12px; }",
 
@@ -734,7 +977,8 @@ const STYLE = [
   "  .nm { flex-wrap: wrap; gap: 1px 8px; } .nm b { flex: 0 1 auto; max-width: 100%; } .nm .url { flex-basis: 100%; }",
   "  .ghead h2 { flex-basis: 100%; } .ghead .field { flex: 1 1 140px; } .field input, .field select { width: 100%; }",
   "  .mem em { display: none; } .steps li { line-height: 1.7; }",
-  "  .intg { grid-template-columns: minmax(0, 1fr); } .mi { width: 22px; height: 22px; } .minis { gap: 3px; }",
+  "  .intg, .bks { grid-template-columns: minmax(0, 1fr); } .mi { width: 22px; height: 22px; } .minis { gap: 3px; }",
+  "  .upd { flex-wrap: wrap; } .upd small { display: block; margin: 0; }",
   "}",
   "@media (prefers-reduced-motion: reduce) { svg.edges path.flow, .beat { animation: none; } }",
 ].join("\n");
@@ -775,10 +1019,10 @@ function tiles(snap, mem) {
 function resourceMap(snap, mem) {
   const byName = new Map(snap.containers.map((c) => [c.name, c]));
   const apps = snap.containers
-    .filter((c) => c.uses.length)
+    .filter((c) => c.uses.length && c.project !== LOCALINFRA_PROJECT)
     .sort((a, b) => (a.project || a.name).localeCompare(b.project || b.name) || a.name.localeCompare(b.name));
   if (!apps.length) {
-    return '<div class="glass empty">No container uses LocalInfra yet. Join a <code>localinfra_*</code> network to show up here.</div>';
+    return '<div class="glass empty">No app uses LocalInfra yet. Join a <code>localinfra_*</code> network to show up here.</div>';
   }
   const H = Math.max(apps.length * 58, RESOURCES.length * 66);
   const yApp = (i) => ((i + 0.5) * H) / apps.length;
@@ -835,7 +1079,15 @@ function versionChip(v) {
   return '<span class="ver" title="Version (' + escape(v.source) + ')">' + escape(text.slice(0, 40)) + "</span>";
 }
 
-function containerRow(c, mem, versions) {
+// A newer release of a pinned image (UPDATE_CHECKS), next to its version
+function updateChip(u) {
+  return u
+    ? '<a class="ver new" href="' + escape(u.check.notes) + '" target="_blank" rel="noopener noreferrer" title="' +
+        escape(u.check.name + " " + u.latest + " is out: release notes") + '">' + icon("up") + escape(u.latest) + "</a>"
+    : "";
+}
+
+function containerRow(c, mem, versions, updates) {
   const chips = c.uses
     .map((key) => {
       const r = RESOURCES.find((x) => x.key === key);
@@ -844,36 +1096,134 @@ function containerRow(c, mem, versions) {
     .join("");
   return (
     '<li class="row st-' + c.state + '"><span class="dot"></span>' +
-    '<div class="who"><span class="nm"><b>' + escape(c.name) + "</b>" + versionChip(versions.get(c.id)) + appLink(c, "url") + "</span><small>" + escape(c.status) + "</small></div>" +
+    '<div class="who"><span class="nm"><b>' + escape(c.name) + "</b>" + versionChip(versions.get(c.id)) + updateChip(updates.get(c.name)) + appLink(c, "url") + "</span><small>" + escape(c.status) + "</small></div>" +
     '<div class="chips">' + chips + "</div>" + memoryCell(mem.get(c.id)) + "</li>"
   );
 }
 
-function projectCard(p, mem, versions) {
+function projectCard(p, mem, versions, updates) {
   let used = 0;
   for (const c of p.containers) used += mem.get(c.id)?.used || 0;
   return (
     '<section class="proj glass"><div class="proj-h"><span class="dot st-' + p.state + '"></span><h3>' + escape(p.name) + "</h3>" +
     '<span class="n">' + p.ok + "/" + p.containers.length + " healthy</span>" +
     '<span class="m">' + (used ? bytes(used) : "") + "</span></div>" +
-    '<ul class="rows">' + p.containers.map((c) => containerRow(c, mem, versions)).join("") + "</ul></section>"
+    '<ul class="rows">' + p.containers.map((c) => containerRow(c, mem, versions, updates)).join("") + "</ul></section>"
   );
+}
+
+// "how long ago" in words; the page script adds the local date and time (the server has no TZ)
+function ago(ms) {
+  const min = Math.round((Date.now() - ms) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return min + " min ago";
+  const h = Math.round(min / 60);
+  if (h < 48) return h + " h ago";
+  return Math.round(h / 24) + " days ago";
+}
+
+const when = (ms) => '<time data-ts="' + ms + '" data-ago="' + ago(ms) + '" datetime="' + new Date(ms).toISOString() + '">' + ago(ms) + "</time>";
+
+const duration = (s) => (s < 90 ? Math.max(0, s) + " s" : Math.round(s / 60) + " min");
+
+// "0 4 * * *" -> "daily at 04:00"; anything fancier is shown as it is
+function schedule(cron) {
+  const f = (cron || "").trim().split(/\s+/);
+  const num = (x) => String(Number(x)) === x;
+  if (f.length === 5 && num(f[0]) && num(f[1]) && f.slice(2).join(" ") === "* * *") {
+    return "daily at " + f[1].padStart(2, "0") + ":" + f[0].padStart(2, "0");
+  }
+  return cron ? "cron " + cron : "";
+}
+
+// globals.sql -> "roles", my_recipes.dump -> "my_recipes"; the Home Assistant .tar keeps its name
+const backupFileName = (name) => (name === "globals.sql" ? "roles (globals.sql)" : name.endsWith(".dump") ? name.slice(0, -5) : name);
+
+function backupCard(j) {
+  const run = j.lastRun;
+  const good = j.lastGood;
+  const info = run || good;
+  const rows = [];
+  if (j.error) rows.push(["Status", '<span class="bad">couldn\'t read it from ' + escape(BACKUP_CONTAINER) + "</span>"]);
+  if (run) {
+    rows.push(["Last run", when(run.finished * 1000) + " · " +
+      (run.ok ? '<span class="good">succeeded</span> in ' + duration(run.finished - run.started) : '<span class="bad">failed: ' + escape(run.error || "see the logs") + "</span>")]);
+  }
+  if (j.successAt && !(run && run.ok && run.finished * 1000 === j.successAt)) rows.push(["Last success", when(j.successAt)]);
+  if (!run && !j.successAt && !j.error) rows.push(["Status", "No backup yet: the first one runs " + (schedule(info && info.schedule) || "at BACKUP_CRON") + "."]);
+  if (j.state === "unhealthy" && j.successAt && Date.now() - j.successAt >= BACKUP_STALE_MS) {
+    rows.push(["", '<span class="bad">No good backup in the last ' + BACKUP_STALE_MS / 3600000 + " hours</span>"]);
+  }
+
+  const files = good && Array.isArray(good.files) ? good.files : [];
+  const shown = files.slice(0, 14);
+  const list = files.length
+    ? '<ul class="files" title="In the newest set">' +
+      shown.map((f) => "<li>" + escape(backupFileName(String(f.name))) + "<em>" + bytes(f.bytes) + "</em></li>").join("") +
+      (files.length > shown.length ? "<li>+" + (files.length - shown.length) + " more</li>" : "") + "</ul>"
+    : "";
+
+  const kept = info
+    ? (info.daily != null ? info.daily + " daily" : "daily") + " (" + info.keepDays + " days)" +
+      (info.monthly != null ? " + " + info.monthly + " monthly" : " + monthly") + " (" + info.keepMonths + " months)"
+    : "";
+  const foot = good && good.set
+    ? '<small class="foot">' + escape(j.key + "/" + good.set) + " · " + bytes(good.bytes) + (kept ? " · sets kept: " + kept : "") + "</small>"
+    : "";
+
+  return (
+    '<section class="bk glass" style="--c: var(--' + j.c + ')"><div class="bk-h"><span class="dot st-' + j.state + '"></span>' +
+    '<span class="gi">' + mark(j.key) + "</span><b>" + escape(j.label) + "</b>" +
+    '<span class="n">' + escape(schedule(info && info.schedule)) + "</span></div>" +
+    '<p class="what">' + escape(j.what) + "</p>" +
+    '<dl class="kv">' + rows.map(([k, v]) => "<dt>" + k + "</dt><dd>" + v + "</dd>").join("") + "</dl>" + list + foot + "</section>"
+  );
+}
+
+function backupSection(b) {
+  if (!b.container) {
+    return '<div class="glass empty">' + escape(BACKUP_CONTAINER) + " is not running here, so nothing is being backed up.</div>";
+  }
+  return (
+    '<div class="bks">' + b.jobs.map(backupCard).join("") + "</div>" +
+    '<p class="intg-note">Saved on the external drive (BACKUP_DIR). Not in it: Redis (cache and queues), the LLM gateway\'s volume ' +
+    "(re-issue keys with new-project.sh --llm --rotate) and the S3 objects, which live on the RAID 1 drive itself.</p>"
+  );
+}
+
+// One banner per pinned image with a newer release
+function updateBanners(updates) {
+  return [...updates.values()]
+    .map(
+      (u) =>
+        '<div class="upd glass" style="--c: var(--' + u.check.c + ')"><span class="gi">' + mark(u.check.brand) + "</span><div>" +
+        "<b>" + escape(u.check.name + " " + u.latest) + " is available</b><small>running " + escape(u.running) + "</small>" +
+        "<p>Set " + chip(null, u.check.env + "=" + u.latest) + " in LocalInfra's <kbd>.env</kbd>, then run " + chip(null, "./deploy.sh " + u.check.service) + "</p></div>" +
+        '<a class="btn" href="' + escape(u.check.notes) + '" target="_blank" rel="noopener noreferrer">' + icon("out") + "Release notes</a></div>",
+    )
+    .join("");
 }
 
 // The part of the page that refreshes itself (GET /live every 15s)
 async function livePart() {
   try {
     const snap = await snapshot();
-    const [mem, versions] = await Promise.all([memoryFor(snap.containers), versionsFor(snap.containers)]);
+    const [mem, versions, updates, backed] = await Promise.all([
+      memoryFor(snap.containers),
+      versionsFor(snap.containers),
+      updatesFor(snap),
+      backups(snap),
+    ]);
     return {
       snap,
       html:
-        tiles(snap, mem) +
+        tiles(snap, mem) + updateBanners(updates) +
         "<h2>Resource map</h2>" + resourceMap(snap, mem) +
         "<h2>Projects</h2>" +
         (snap.projects.length
-          ? snap.projects.map((p) => projectCard(p, mem, versions)).join("")
-          : '<div class="glass empty">No containers of yours yet.</div>'),
+          ? snap.projects.map((p) => projectCard(p, mem, versions, updates)).join("")
+          : '<div class="glass empty">No containers of yours yet.</div>') +
+        "<h2>Backups</h2>" + backupSection(backed),
     };
   } catch (error) {
     return { snap: null, html: '<div class="glass empty">❗ Docker unavailable: ' + escape(error.message) + "</div>" };
@@ -890,43 +1240,43 @@ const chip = (key, fallback) =>
 // which keys are set. "callback" is the OAuth redirect path, shown with the app's address.
 
 const GOOGLE_SIGNIN = {
-  icon: "google", c: "postgres", name: "Google sign-in", tags: ["Sign-in"], guide: "google",
+  icon: "google", c: "google", name: "Google sign-in", tags: ["Sign-in"], guide: "google",
   env: ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"], callback: "/api/auth/callback/google",
 };
 
 const INTEGRATIONS = {
   "yarg-aggregator": [
-    { ...GOOGLE_SIGNIN, name: "Google sign-in + YouTube Music", tags: ["Sign-in", "Import"],
+    { ...GOOGLE_SIGNIN, name: "Google sign-in + YouTube Music", tags: ["Sign-in", "Import"], logos: ["youtubemusic"],
       what: "The youtube.readonly scope lets members import their YouTube Music playlists. Turn on YouTube Data API v3 in the same Cloud project." },
-    { icon: "music", c: "spotify", name: "Spotify", tags: ["Sign-in", "Import"],
+    { icon: "spotify", c: "spotify", name: "Spotify", tags: ["Sign-in", "Import"],
       what: "Sign-in, then import of the member's playlists and saved tracks; public playlist URLs and song links use the same app credentials.",
       env: ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET"], callback: "/api/auth/callback/spotify",
       link: ["https://developer.spotify.com/dashboard", "Spotify dashboard"] },
-    { icon: "play", c: "youtube", name: "YouTube Music", tags: ["Import"],
+    { icon: "youtubemusic", c: "youtube", name: "YouTube Music", tags: ["Import"],
       what: "Public YouTube Music and YouTube playlist URLs, matched against the chart library, and YouTube song links.",
       env: ["YOUTUBE_API_KEY"], link: ["https://console.cloud.google.com/apis/library/youtube.googleapis.com", "YouTube Data API"] },
-    { icon: "user", c: "apple", name: "Apple", tags: ["Sign-in", "Import"],
+    { icon: "apple", c: "apple", name: "Apple", tags: ["Sign-in", "Import"],
       what: "Optional Sign in with Apple (Service ID + Auth key) and Apple Music library import (a separate MusicKit key).",
       env: ["APPLE_CLIENT_ID", "APPLE_TEAM_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_MUSIC_KEY_ID", "APPLE_MUSIC_PRIVATE_KEY"],
       callback: "/api/auth/callback/apple", link: ["https://developer.apple.com/account/resources/identifiers/list/serviceId", "Apple Developer"] },
-    { icon: "music", c: "lastfm", name: "Last.fm", tags: ["Sign-in", "Import"],
+    { icon: "lastfm", c: "lastfm", name: "Last.fm", tags: ["Sign-in", "Import"],
       what: "Sign-in and import; only offered when both keys are set.",
       env: ["LASTFM_API_KEY", "LASTFM_API_SECRET"], link: ["https://www.last.fm/api/account/create", "Last.fm API account"] },
-    { icon: "feed", c: "tunnel", name: "Enchor.us + Rhythmverse", tags: ["Data"],
+    { icon: "feed", c: "tunnel", name: "Enchor.us + Rhythmverse", tags: ["Data"], logos: ["deezer", "soundcloud"],
       what: "The chart listings, fetched from Admin → Providers with their rate limits respected. Song links also use Deezer (no key) and SoundCloud (SOUNDCLOUD_CLIENT_ID)." },
   ],
   "my-recipes": [
     GOOGLE_SIGNIN,
-    { icon: "alexa", c: "neon", name: "Alexa · Minhas Receitas", tags: ["Alexa", "Echo Show"], guide: "alexa",
+    { icon: "alexa", c: "alexa", name: "Alexa · Minhas Receitas", tags: ["Alexa", "Echo Show"], guide: "alexa",
       what: "Pick a recipe by voice or touch, ingredients on screen, substitutes, then step by step with device timers. Same step as the web cook mode.",
       env: ["ALEXA_SKILL_ID"] },
-    { icon: "play", c: "youtube", name: "YouTube", tags: ["Import"],
+    { icon: "youtube", c: "youtube", name: "YouTube", tags: ["Import"],
       what: "Recipe import from videos (transcripts need no key) and saved playlists; the key reads descriptions and lists playlists.",
       env: ["YOUTUBE_API_KEY"], link: ["https://console.cloud.google.com/apis/library/youtube.googleapis.com", "YouTube Data API"] },
   ],
   "sports-cal": [
     { ...GOOGLE_SIGNIN, what: "ALLOWED_EMAILS decides who may create an account, by e-mail or Google." },
-    { icon: "alexa", c: "neon", name: "Alexa · Radar Esportivo", tags: ["Alexa", "Echo Show"], guide: "alexa",
+    { icon: "alexa", c: "alexa", name: "Alexa · Radar Esportivo", tags: ["Alexa", "Echo Show"], guide: "alexa",
       what: "The admin's agenda, results, standings and where to watch by voice; reminders before kick-off and Echo notifications (match alert, goal, final score), set in /admin.",
       env: ["ALEXA_SKILL_ID", "ALEXA_CLIENT_ID", "ALEXA_CLIENT_SECRET"] },
     { icon: "bell", c: "warn", name: "Web Push", tags: ["Push"],
@@ -935,11 +1285,11 @@ const INTEGRATIONS = {
     { icon: "search", c: "s3", name: "SerpApi", tags: ["Paid API"],
       what: "Optional Google results in search and where-to-watch lookups, cached; the Alexa skill never calls it.",
       env: ["SERPAPI_API_KEY"], link: ["https://serpapi.com/manage-api-key", "SerpApi"] },
-    { icon: "feed", c: "tunnel", name: "ESPN, CBV, LoL Esports, Wikidata", tags: ["Data"],
+    { icon: "feed", c: "tunnel", name: "ESPN, CBV, LoL Esports, Wikidata", tags: ["Data"], logos: ["leagueoflegends", "wikidata"],
       what: "Public sources, no key (LOLESPORTS_API_KEY only if Riot rotates the site's key), re-synced by the 2-minute scheduler." },
   ],
   "brain-gym": [
-    { icon: "alexa", c: "neon", name: "Alexa · Treino do Cérebro / Brain Gym", tags: ["Alexa", "Echo Show"], guide: "alexa",
+    { icon: "alexa", c: "alexa", name: "Alexa · Treino do Cérebro / Brain Gym", tags: ["Alexa", "Echo Show"], guide: "alexa",
       what: "Mundi and Craque by voice, pt-BR and en-US. No accounts: game state lives in the browser and in the Alexa session.",
       env: ["ALEXA_SKILL_ID", "PUBLIC_URL"] },
   ],
@@ -972,6 +1322,8 @@ const ALEXA_SKILLS = {
 
 function integrationRow(it, origin) {
   const tags = it.tags.map((t) => '<span class="rc tag" style="--c: var(--' + it.c + ')">' + escape(t) + "</span>").join("");
+  // Other services the row covers (song links, data sources), by their logos
+  const logos = it.logos ? '<span class="logos">' + it.logos.map((l) => brand(l)).join("") + "</span>" : "";
   const env = (it.env || []).map((e) => "<code>" + escape(e) + "</code>").join("");
   const callback = it.callback && origin ? "<code title=\"OAuth redirect URI\">" + escape(origin + it.callback) + "</code>" : "";
   const link = it.guide
@@ -981,8 +1333,8 @@ function integrationRow(it, origin) {
       : "";
   const extra = env || callback || link;
   return (
-    '<li class="irow"><span class="gi" style="--c: var(--' + it.c + ')">' + icon(it.icon) + "</span><div>" +
-    "<b>" + escape(it.name) + "</b>" + tags + (it.what ? "<p>" + escape(it.what) + "</p>" : "") +
+    '<li class="irow"><span class="gi" style="--c: var(--' + it.c + ')">' + mark(it.icon) + "</span><div>" +
+    "<b>" + escape(it.name) + "</b>" + logos + tags + (it.what ? "<p>" + escape(it.what) + "</p>" : "") +
     (extra ? '<div class="env">' + env + callback + link + "</div>" : "") + "</div></li>"
   );
 }
@@ -998,7 +1350,7 @@ function integrations(snap) {
       const list = INTEGRATIONS[name];
       // Closed by default: the summary shows the app and one small icon per integration
       const minis = list
-        .map((it) => '<span class="mi" style="--c: var(--' + it.c + ')" title="' + escape(it.name) + '">' + icon(it.icon) + "</span>")
+        .map((it) => '<span class="mi" style="--c: var(--' + it.c + ')" title="' + escape(it.name) + '">' + mark(it.icon) + "</span>")
         .join("");
       return (
         '<details class="icard glass"><summary>' + (c ? appIcon(c) : "") +
@@ -1043,7 +1395,7 @@ function guides(snap) {
 
   const cloudflare =
     '<details class="guide glass" style="--c: var(--tunnel)" id="guide-cloudflare">' +
-    '<summary><span class="gi">' + icon("tunnel") + "</span><div><b>Publish an app on Cloudflare</b>" +
+    '<summary><span class="gi">' + brand("cloudflare") + "</span><div><b>Publish an app on Cloudflare</b>" +
     "<small>Add a route to the tunnel so the app gets a public HTTPS address</small></div>" + icon("chevron", "chev") + "</summary>" +
     '<div class="gbody">' +
     '<a class="btn" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Cloudflare Zero Trust</a>" +
@@ -1062,8 +1414,8 @@ function guides(snap) {
     "</ol></div></details>";
 
   const google =
-    '<details class="guide glass" style="--c: var(--postgres)" id="guide-google">' +
-    '<summary><span class="gi">' + icon("google") + "</span><div><b>Add Google sign-in</b>" +
+    '<details class="guide glass" style="--c: var(--google)" id="guide-google">' +
+    '<summary><span class="gi">' + brand("google") + "</span><div><b>Add Google sign-in</b>" +
     "<small>Create an OAuth client in Google Cloud Console</small></div>" + icon("chevron", "chev") + "</summary>" +
     '<div class="gbody">' +
     '<a class="btn" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Google Cloud Console</a>" +
@@ -1099,8 +1451,8 @@ function guides(snap) {
     '<div class="app-note" data-for-none hidden>This app has no Alexa skill. The ones that do: ' + Object.keys(ALEXA_SKILLS).sort().join(", ") + ".</div>";
 
   const alexa =
-    '<details class="guide glass" style="--c: var(--neon)" id="guide-alexa">' +
-    '<summary><span class="gi">' + icon("alexa") + "</span><div><b>Connect an Alexa skill</b>" +
+    '<details class="guide glass" style="--c: var(--alexa)" id="guide-alexa">' +
+    '<summary><span class="gi">' + brand("alexa") + "</span><div><b>Connect an Alexa skill</b>" +
     "<small>A custom skill that calls the app's own HTTPS endpoint and draws on Echo Show screens</small></div>" + icon("chevron", "chev") + "</summary>" +
     '<div class="gbody">' +
     '<a class="btn" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("out") + "Open Alexa Developer Console</a>" +
@@ -1151,9 +1503,17 @@ const SCRIPT = [
   "  function refresh() {",
   "    if (document.hidden) return;",
   "    fetch('live', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })",
-  "      .then(function (html) { live.innerHTML = html; beat.classList.remove('off'); now(); })",
+  "      .then(function (html) { live.innerHTML = html; stamps(); beat.classList.remove('off'); now(); })",
   "      .catch(function () { beat.classList.add('off'); stamp.textContent = 'offline, retrying'; });",
   "  }",
+  "  // Backup times: the server only knows how long ago, the browser adds its local date and time",
+  "  function stamps() {",
+  "    live.querySelectorAll('time[data-ts]').forEach(function (t) {",
+  "      var d = new Date(Number(t.getAttribute('data-ts')));",
+  "      t.textContent = d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' (' + t.getAttribute('data-ago') + ')';",
+  "    });",
+  "  }",
+  "  stamps();",
   "  now();",
   "  setInterval(refresh, 15000);",
   "  document.addEventListener('visibilitychange', refresh);",
@@ -1246,14 +1606,14 @@ async function statusPage() {
     '<div><h1>Container Health</h1><div class="sub"><span class="beat" id="beat"></span><span id="stamp"></span>' +
       '<span class="extra">· your containers, umbrelOS apps hidden</span></div></div></div>',
     '<nav class="links">' +
-      '<a class="btn" style="--c: var(--tunnel)" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + icon("tunnel") + "Cloudflare</a>" +
-      '<a class="btn" style="--c: var(--postgres)" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + icon("google") + "Google Cloud</a>" +
-      '<a class="btn" style="--c: var(--neon)" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + icon("alexa") + "Alexa</a>" +
+      '<a class="btn" style="--c: var(--tunnel)" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener noreferrer">' + brand("cloudflare") + "Cloudflare</a>" +
+      '<a class="btn" style="--c: var(--google)" href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">' + brand("googlecloud") + "Google Cloud</a>" +
+      '<a class="btn" style="--c: var(--alexa)" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + brand("alexa") + "Alexa</a>" +
       "</nav></header>",
     '<div id="live">' + html + "</div>",
     integrations(snap),
     guides(snap),
-    "<footer>Read-only: this page only lists containers and reads their memory and version.</footer>",
+    "<footer>Read-only: this page only lists containers and reads their memory, version and backup status.</footer>",
     "</main>",
     "<script>" + SCRIPT + "</script>",
     "</body>",

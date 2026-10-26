@@ -306,11 +306,17 @@ the newest Home Assistant backup (each step runs even if the other fails):
   daily/2026-10-14_0400/   globals.sql (roles) + <db>.dump per database   kept BACKUP_KEEP_DAYS
   monthly/...              copy of the backup from the 1st of each month  kept BACKUP_KEEP_MONTHS
   last_success             timestamp of the last good run
+  last_success.json        what the last good run wrote (files, sizes), for Container Health
 <BACKUP_DIR>/homeassistant/
   daily/2026-10-18_0400/   Automatic_backup_<version>_<date>.tar           same retention
   monthly/...
-  last_success
+  last_success, last_success.json
 ```
+
+Every run, good or failed, also leaves its result in `/run/backup-status/<job>.json` inside the
+container (`backup/status.sh`), so a failure is recorded even when the drive is missing. The
+Container Health status page reads these files (section 6) to show what is backed up and how
+the last run went.
 
 `localinfra-backup` turns **unhealthy** when no backup succeeded in the last 26 hours,
 so a missed backup shows up in `docker ps` and in the Container Health widget. (For Home
@@ -349,15 +355,24 @@ widgets.
 
 The status page refreshes every 15 seconds (only while it's visible) and shows:
 
-- **Resource map**: which containers use which LocalInfra resource (Postgres, Redis, S3, the LLM
-  gateway, the Cloudflare tunnel), read from the networks each container joins. Hover a node to highlight its
+- **Update banner**: when Docker Hub has a newer `cloudflare/cloudflared` release than the
+  tunnel's `CLOUDFLARED_VERSION`, with the line to put in `.env` and `./deploy.sh tunnel`. The
+  version chip in Projects gets an arrow linking to the release notes. More pinned images can
+  be added to `UPDATE_CHECKS` in `server.mjs.template`.
+- **Resource map**: which apps use which LocalInfra resource (Postgres, Redis, S3, the LLM
+  gateway, the Cloudflare tunnel), read from the networks each container joins. LocalInfra's own
+  containers (like `localinfra-backup`, on the Postgres network to dump it) are left out. Hover a node to highlight its
   links. When an app has the label `localinfra.url=https://...` (the app template sets it from
   `NEXT_PUBLIC_APP_URL`), the map shows the app's own icon, linking to that address. The server
   reads the icon from the app's `<link rel="icon">` (SVG first, then a small PNG, then
   `/favicon.ico`), keeps it for 12 hours, and shows a globe while the app can't be reached.
 - **Projects**: every container with its status, resources, public address and memory
   (used / limit), LocalInfra included.
-- **Integrations**: what each app connects to outside LocalInfra (Google sign-in, Alexa skills with
+- **Backups**: for Postgres and Home Assistant, what the newest set holds (each database with its
+  size, the Home Assistant `.tar`), when the last run was and whether it succeeded (with the step
+  that failed), the last success, the schedule and how many sets are kept, plus what is not in
+  the backup.
+- **Integrations**: each service with its real logo (Google sign-in, Alexa skills with
   Echo Show screens, Spotify, YouTube Music, Apple, Last.fm, Web Push, SerpApi, data sources), with
   the env keys and OAuth redirect URIs. It's a list kept in `server.mjs.template` (`INTEGRATIONS`,
   `ALEXA_SKILLS`): update it when an app gains or drops one. The page never reads an app's
@@ -383,8 +398,11 @@ umbrelOS) and only calls `GET /containers/json` and, while the status page is op
 `GET /containers/<id>/stats` (one-shot, cached 10 seconds) for the memory readings, and once
 per container `GET /containers/<id>/json` + `/archive` to read the `version` of the
 `package.json` in its working directory (images not tagged `:latest` show their tag instead,
-and an `org.opencontainers.image.version` label wins over both). The only
-other outbound requests fetch the icons of the apps' `localinfra.url` addresses.
+and an `org.opencontainers.image.version` label wins over both). `/archive` also reads the
+backup status files of `localinfra-backup` (cached 1 minute); never a container's environment.
+The only other outbound requests fetch the icons of the apps' `localinfra.url` addresses and,
+at most every 12 hours while the page is open, the tag list of `cloudflare/cloudflared` on
+Docker Hub. The brand logos are inline SVG (Simple Icons, CC0), not fetched.
 
 ### Install (once, in the Umbrel UI)
 

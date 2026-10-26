@@ -243,7 +243,7 @@ services:
 
   tunnel:
     container_name: localinfra-tunnel
-    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.9.3}
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.10.4}
     restart: unless-stopped
     # Routes (hostname → http://<container>:<port>) live in Cloudflare Zero Trust, not here.
     command: ["tunnel", "--no-autoupdate", "run"]
