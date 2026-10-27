@@ -6,6 +6,7 @@
 #   s3        → network "localinfra_s3"        (Garage; one bucket + one access key per project)
 #   tunnel    → network "localinfra_tunnel"    (Cloudflare tunnel; reaches public apps by container name)
 #   llm       → network "localinfra_llm"       (LLM gateway + local model; one key + paid-call limits per project)
+#   metrics   → network "localinfra_metrics"   (anonymous usage metrics from the apps; one key per project)
 #
 # Projects join only the network(s) they need, as external networks.
 # New project:   scripts/new-project.sh <name>
@@ -241,6 +242,49 @@ services:
           memory: ${LLM_MEMORY_LIMIT:-2G}
     logging: *logging
 
+  metrics:
+    # Light, anonymous usage metrics (Web Vitals, route views, errors) sent by each app's own
+    # /api/metrics route. No published port and no tunnel route: only apps on localinfra_metrics
+    # reach it. Container Health shows /run/metrics/summary.json (read through Docker).
+    container_name: localinfra-metrics
+    build:
+      context: ./metrics
+      args:
+        NODE_VERSION: ${METRICS_NODE_VERSION:-24}
+    image: localinfra-metrics:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-UTC}
+      # Its own role + database (scripts/new-project.sh localinfra_metrics --no-redis), never the superuser
+      METRICS_DATABASE_URL: ${METRICS_DATABASE_URL:-}
+      METRICS_KEEP_HOURLY_DAYS: ${METRICS_KEEP_HOURLY_DAYS:-7}
+      METRICS_KEEP_DAILY_DAYS: ${METRICS_KEEP_DAILY_DAYS:-180}
+      METRICS_KEEP_ERROR_DAYS: ${METRICS_KEEP_ERROR_DAYS:-90}
+    volumes:
+      # Only the summary Container Health reads (rebuilt from Postgres at start). A volume, not a
+      # tmpfs: Docker's archive endpoint, which Container Health reads it with, can't see a tmpfs.
+      - metrics_summary:/run/metrics
+    networks:
+      - metrics
+      - postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4100/health').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: ${METRICS_MEMORY_LIMIT:-128M}
+    logging: *logging
+
   tunnel:
     container_name: localinfra-tunnel
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.10.4}
@@ -270,6 +314,7 @@ volumes:
   postgres_data:
   redis_data:
   llm_data:
+  metrics_summary:
 
 networks:
   postgres:
@@ -282,3 +327,5 @@ networks:
     name: localinfra_tunnel
   llm:
     name: localinfra_llm
+  metrics:
+    name: localinfra_metrics

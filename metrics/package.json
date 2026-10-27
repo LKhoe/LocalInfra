@@ -1,0 +1,12 @@
+{
+  "name": "localinfra-metrics",
+  "private": true,
+  "type": "module",
+  "description": "Light, anonymous usage metrics for the LocalInfra apps",
+  "scripts": {
+    "test": "node --test test.mjs"
+  },
+  "dependencies": {
+    "postgres": "3.4.9"
+  }
+}

@@ -9,6 +9,7 @@ small umbrelOS app that shows whether your containers are healthy.
 | Redis 7.4 | `localinfra-redis` | `localinfra_redis` | own ACL user, limited to keys/channels `<project>:*` |
 | S3 (Garage 2.4) | `localinfra-s3` | `localinfra_s3` | own bucket + own access key; can't see, create or delete other buckets |
 | LLM | `localinfra-llm` | `localinfra_llm` | own key + own limits on paid calls, see [LLM gateway](#llm-gateway) |
+| Metrics | `localinfra-metrics` | `localinfra_metrics` | own key; anonymous usage metrics, see [Metrics](#metrics) |
 | Backup | `localinfra-backup` | `localinfra_postgres` | nightly dump of every database + copy of Home Assistant's backup to the external drive |
 | Cloudflare tunnel | `localinfra-tunnel` | `localinfra_tunnel` | reaches only the apps that join `localinfra_tunnel` |
 | Container Health | `localinfra-health_server_1` | (umbrelOS app) | home-screen widgets, see [section 6](#6-container-health-widget-umbrelos) |
@@ -24,6 +25,7 @@ LocalInfra/
   redis/                        tiny image: redis + ACL bootstrap (start.sh)
   s3/                           tiny image: Garage binary on Alpine + marker check (start.sh)
   llm/                          Ollama image + the LLM gateway (server.mjs, store.mjs, admin.mjs, start.sh)
+  metrics/                      anonymous usage metrics from the apps (server, store, admin, tests)
   backup/                       tiny image: pg_dump + busybox crond (backup.sh, backup-homeassistant.sh)
   scripts/bootstrap-pi.sh       first deploy from the Mac: LocalInfra + yarg, with checks
   scripts/new-project.sh        provision a project (db role + redis user + S3 key), print its env
@@ -188,13 +190,14 @@ DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-redis   # postgres only
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --s3         # postgres + redis + S3 bucket/key
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --llm        # postgres + redis + LLM key
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-postgres --no-redis --llm   # just an LLM key
+DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --no-postgres --no-redis --metrics   # just a metrics key
 DOCKER_CONTEXT=umbrel scripts/new-project.sh myapp --rotate     # new passwords, data untouched
 ```
 
 The script prints the env block for the project (`DATABASE_URL`, `POSTGRES_HOST`,
 `REDIS_HOST`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_KEY_PREFIX`, and with `--s3`:
 `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`; with `--llm`:
-`LLM_BASE_URL`, `LLM_API_KEY`). Put it in the
+`LLM_BASE_URL`, `LLM_API_KEY`; with `--metrics`: `METRICS_URL`, `METRICS_API_KEY`). Put it in the
 project's `.env` and join the networks in its compose:
 
 ```yaml
@@ -287,6 +290,54 @@ DOCKER_CONTEXT=umbrel docker exec -e REDISCLI_AUTH="$(sed -n 's/^REDIS_ADMIN_PAS
   sh -c 'redis-cli --no-auth-warning ACL DELUSER myapp && redis-cli --no-auth-warning ACL SAVE'
 ```
 
+### Metrics
+
+`localinfra-metrics` collects light, **anonymous** usage metrics from the apps and the Container
+Health page shows them (section 6, "Metrics"). Nothing goes to an outside service.
+
+```
+browser ── sendBeacon ──► https://<app>/api/metrics      same origin, through the app's own tunnel route
+                            checks schema + size (8 KB), 30 req/min per IP, 600 req/min per app
+next server (onRequestError) ┤
+                            ▼  network localinfra_metrics, Authorization: Bearer mx_...
+                      localinfra-metrics:4100            no published port, no tunnel route
+                            │  checks again (16 KB, 50 events, 2000 events/min per app), aggregates in memory
+                            ▼  every minute
+                      Postgres: database + role localinfra_metrics (hourly and daily rows only)
+                            │  every minute: /run/metrics/summary.json (volume metrics_summary)
+                            ▼
+                      Container Health reads it through Docker (/archive), behind the Umbrel login
+```
+
+What an app sends, exactly (`metrics/schema.mjs`, `templates/app/lib/metrics/schema.ts`):
+`device` (`mobile` | `desktop`, from the window width) and up to 20 events of three kinds:
+`view` (route), `vital` (route, `LCP` | `INP` | `CLS` | `FCP` | `TTFB` | `NAV`, value) and
+`error` (route, `client` | `server`, error name, message scrubbed of e-mails, URLs, long numbers
+and tokens, source file and line). The route is the **pattern** (`/recipes/[id]`), never the real
+path. No IP, user agent, language, referrer, cookie, user or session id, or client timestamp; the
+service stamps the hour. `NAV` is the time from a click on an in-app link to the new route painted.
+
+Storage: per app, route, metric and device, one row per hour and one per day with a count, a sum
+and a 12-bucket histogram (p50/p75/p95 come from it). At most 60 routes and 100 distinct errors per
+app per day (the rest count as `(other)`). Kept 7 days by hour, 180 days by day, errors 90 days
+(`METRICS_KEEP_*`). The database is small (a few MB) and is in the nightly backup like any other.
+
+Setup, once: `DOCKER_CONTEXT=umbrel scripts/new-project.sh localinfra_metrics --no-redis`, put its
+`DATABASE_URL` in `.env` as `METRICS_DATABASE_URL`, then `./deploy.sh metrics`. For each app:
+`provision-app.sh <app> <dir> --no-postgres --no-redis --metrics`, join `localinfra_metrics` in its
+compose and copy the files from `templates/app/` (`lib/metrics/`, `components/metrics.tsx`,
+`app/api/metrics/route.ts`, plus `<Metrics />` in the root layout and `onRequestError` in
+`instrumentation.ts`).
+
+```bash
+DOCKER_CONTEXT=umbrel docker exec localinfra-metrics metrics-admin list              # apps with a key
+DOCKER_CONTEXT=umbrel docker exec localinfra-metrics metrics-admin remove my_recipes # the key stops working
+```
+
+Anyone can post made-up numbers to an app's `/api/metrics` (it needs no login, like any web
+analytics); the limits keep that to skewed charts. Tests: `METRICS_TEST_DATABASE_URL=... node --test metrics/test.mjs`
+(without the variable only the parts without Postgres run).
+
 ### Moving an existing database in
 
 ```bash
@@ -368,6 +419,10 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
   `/favicon.ico`), keeps it for 12 hours, and shows a globe while the app can't be reached.
 - **Projects**: every container with its status, resources, public address and memory
   (used / limit), LocalInfra included.
+- **Metrics**: for each app that sends them (section 4, [Metrics](#metrics)), the views, the
+  Web Vitals and in-app navigation time at the 75th percentile (green, amber, red by the Web
+  Vitals thresholds), the busiest routes and the newest errors, for 24 hours, 7 days or 30 days,
+  with a bar per day for the last 30. Read from `localinfra-metrics`' summary file through Docker.
 - **Backups**: for Postgres and Home Assistant, what the newest set holds (each database with its
   size, the Home Assistant `.tar`), when the last run was and whether it succeeded (with the step
   that failed), the last success, the schedule and how many sets are kept, plus what is not in
@@ -399,7 +454,8 @@ umbrelOS) and only calls `GET /containers/json` and, while the status page is op
 per container `GET /containers/<id>/json` + `/archive` to read the `version` of the
 `package.json` in its working directory (images not tagged `:latest` show their tag instead,
 and an `org.opencontainers.image.version` label wins over both). `/archive` also reads the
-backup status files of `localinfra-backup` (cached 1 minute); never a container's environment.
+backup status files of `localinfra-backup` and the metrics summary of `localinfra-metrics` (each
+cached 1 minute); never a container's environment.
 The only other outbound requests fetch the icons of the apps' `localinfra.url` addresses and,
 at most every 12 hours while the page is open, the tag list of `cloudflare/cloudflared` on
 Docker Hub. The brand logos are inline SVG (Simple Icons, CC0), not fetched.
@@ -464,7 +520,7 @@ ssh -N -L 15432:127.0.0.1:5432 -L 16379:127.0.0.1:6379 -L 13900:127.0.0.1:3900 -
 - **What's isolated, and what isn't:** credentials and permissions separate the
   projects. Projects on the same network can still reach each other's containers, so
   don't run admin UIs without auth on these networks.
-- **Ports:** Postgres, Redis, the S3 API and the LLM gateway are published on the Pi's loopback only
+- **Ports:** `localinfra-metrics` publishes no port at all. Postgres, Redis, the S3 API and the LLM gateway are published on the Pi's loopback only
   (`POSTGRES_PUBLISH` / `REDIS_PUBLISH` / `S3_PUBLISH` / `LLM_PUBLISH`); use the SSH tunnel above to reach
   them. Garage's RPC and admin ports are never published.
 - **Upgrading Ollama:** bump `OLLAMA_VERSION`, then `./deploy.sh llm`.

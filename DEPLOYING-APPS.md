@@ -11,6 +11,7 @@ app. Reference implementation: **my-recipes**.
                                               ├─ localinfra_redis    → ACL user, keys "<app_name>:*"
                                               ├─ localinfra_s3       → bucket <app-name> + key
                                               ├─ localinfra_llm      → LLM key, limits on paid calls
+                                              ├─ localinfra_metrics  → metrics key (anonymous usage metrics)
                                               └─ localinfra_tunnel   → Cloudflare tunnel → https://<app>.<domain>
 ```
 
@@ -68,6 +69,7 @@ Copy from `templates/app/` into the app repo and replace `myapp` / `30XX`:
 | `deploy.sh` | repo root | nothing (same file in every app) |
 | `Dockerfile`, `docker-entrypoint.sh`, `scripts/migrate.mjs` | same paths | only for a Next.js + Drizzle app; otherwise write your own that keeps rules 8–9 |
 | `app/api/health/route.ts` | same path | add the app's other dependencies |
+| `lib/metrics/`, `components/metrics.tsx`, `app/api/metrics/route.ts` | same paths | optional, anonymous usage metrics: add `<Metrics />` to the root layout and `onRequestError` to `instrumentation.ts` |
 | `.env.example` | repo root | the app's own settings |
 
 `.gitignore` must contain:
@@ -83,11 +85,12 @@ Add the app to the port table above.
 ### 2. Provision on LocalInfra and write `.env` (once)
 
 ```bash
-DOCKER_CONTEXT=umbrel ../LocalInfra/scripts/provision-app.sh <app_name> <path/to/app> [--no-redis] [--s3] [--llm]
+DOCKER_CONTEXT=umbrel ../LocalInfra/scripts/provision-app.sh <app_name> <path/to/app> [--no-redis] [--s3] [--llm] [--metrics]
 ```
 
 An app that already exists and only needs the LLM key:
-`provision-app.sh <app_name> <path/to/app> --no-postgres --no-redis --llm` (then `./deploy.sh`).
+`provision-app.sh <app_name> <path/to/app> --no-postgres --no-redis --llm` (then `./deploy.sh`), and the
+same with `--metrics` for the metrics key (README section 4, "Metrics").
 
 `<app_name>` uses `_`, not `-` (`my_recipes`): it names the database, the role and the keys.
 The script creates them, writes the credentials into the app's `.env` (from `.env.example` if

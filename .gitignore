@@ -3,3 +3,4 @@ backups-local/
 .DS_Store
 s3-local/
 ha-backups-local/
+node_modules/
