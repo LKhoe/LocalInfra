@@ -42,6 +42,9 @@ services:
       # LLM (provision-app.sh --llm): OpenAI-compatible, model "simple" | "medium" | "hard"
       - LLM_BASE_URL=${LLM_BASE_URL:-http://localinfra-llm:4000/v1}
       - LLM_API_KEY=${LLM_API_KEY:?set LLM_API_KEY in .env}
+      # Metrics (provision-app.sh --metrics): anonymous usage metrics from /api/metrics
+      - METRICS_URL=${METRICS_URL:-http://localinfra-metrics:4100}
+      - METRICS_API_KEY=${METRICS_API_KEY:-}
       # ---- App
       - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
       - NODE_ENV=production
@@ -62,6 +65,7 @@ services:
       - localinfra_redis
       - localinfra_s3
       - localinfra_llm
+      - localinfra_metrics
       # Public access through LocalInfra's Cloudflare tunnel: http://myapp:3000
       - localinfra_tunnel
     deploy:
@@ -83,6 +87,8 @@ networks:
   localinfra_s3:
     external: true
   localinfra_llm:
+    external: true
+  localinfra_metrics:
     external: true
   localinfra_tunnel:
     external: true

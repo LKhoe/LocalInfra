@@ -9,15 +9,17 @@
 #             read/write that bucket only: it can't see other buckets, create or delete buckets.
 #   LLM:      (opt-in, --llm) an app key for the LLM gateway (localinfra-llm), with the default
 #             limits on paid calls; change them with  docker exec localinfra-llm llm-admin limits
+#   Metrics:  (opt-in, --metrics) an app key for localinfra-metrics (anonymous usage metrics)
 #
 # Usage:
-#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis] [--s3] [--llm]
+#   scripts/new-project.sh <name> [--rotate] [--no-postgres] [--no-redis] [--s3] [--llm] [--metrics]
 #
 #   --rotate       project already exists: issue new passwords/keys (data is untouched)
 #   --no-postgres  skip the Postgres role + database
 #   --no-redis     skip the Redis user
 #   --s3           also create the S3 bucket + access key (Garage)
 #   --llm          also create an LLM gateway key
+#   --metrics      also create a metrics key
 #
 # Runs against whatever your docker CLI points at: on the Pi itself, or from the
 # Mac with  DOCKER_CONTEXT=umbrel scripts/new-project.sh <name>
@@ -29,8 +31,9 @@ PG_CONTAINER=localinfra-postgres
 REDIS_CONTAINER=localinfra-redis
 S3_CONTAINER=localinfra-s3
 LLM_CONTAINER=localinfra-llm
+METRICS_CONTAINER=localinfra-metrics
 
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 
 # Read KEY from .env without executing it (values may contain spaces, "*", ...)
 env_get() {
@@ -40,7 +43,7 @@ env_get() {
 
 gen_password() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
-name=""; rotate=false; want_pg=true; want_redis=true; want_s3=false; want_llm=false
+name=""; rotate=false; want_pg=true; want_redis=true; want_s3=false; want_llm=false; want_metrics=false
 for arg in "$@"; do
   case "$arg" in
     --rotate) rotate=true ;;
@@ -48,6 +51,7 @@ for arg in "$@"; do
     --no-redis) want_redis=false ;;
     --s3) want_s3=true ;;
     --llm) want_llm=true ;;
+    --metrics) want_metrics=true ;;
     -h|--help) usage ;;
     -*) echo "Unknown option: $arg" >&2; usage ;;
     *) [[ -z "$name" ]] || usage; name="$arg" ;;
@@ -183,6 +187,21 @@ if $want_llm; then
   echo "LLM: key \"$name\" ready. $(llm_admin limits "$name" | sed "s/^$name: //")" >&2
 fi
 
+# ---------------------------------------------------------------- Metrics
+metrics_admin() { docker exec -i "$METRICS_CONTAINER" metrics-admin "$@"; }
+if $want_metrics; then
+  require_healthy "$METRICS_CONTAINER"
+  if metrics_admin has "$name" && [[ "$rotate" != true ]]; then
+    echo "Metrics key \"$name\" already exists. Use --rotate to issue a new one." >&2
+    exit 1
+  fi
+  METRICS_KEY=$(metrics_admin rotate "$name")
+  if [[ ! "$METRICS_KEY" =~ ^mx_[0-9a-f]{48}$ ]]; then
+    echo "Could not read the new metrics key from metrics-admin." >&2; exit 1
+  fi
+  echo "Metrics: key \"$name\" ready." >&2
+fi
+
 # ---------------------------------------------------------------- Output
 echo >&2
 echo "# ---- add to the project's .env (on the machine that runs its compose) ----" >&2
@@ -217,10 +236,17 @@ LLM_BASE_URL=http://$LLM_CONTAINER:4000/v1
 LLM_API_KEY=$LLM_KEY
 EOF
 fi
+if $want_metrics; then
+  cat <<EOF
+METRICS_URL=http://$METRICS_CONTAINER:4100
+METRICS_API_KEY=$METRICS_KEY
+EOF
+fi
 echo >&2
 nets=()
 $want_pg && nets+=("localinfra_postgres")
 $want_redis && nets+=("localinfra_redis")
 $want_s3 && nets+=("localinfra_s3")
 $want_llm && nets+=("localinfra_llm")
+$want_metrics && nets+=("localinfra_metrics")
 echo "# and join the external network(s): ${nets[*]}" >&2

@@ -2,7 +2,7 @@ manifestVersion: 1
 id: localinfra-health
 category: developer
 name: Container Health
-version: "1.3.0"
+version: "1.4.0"
 tagline: See at a glance whether the containers you run are healthy
 icon: https://raw.githubusercontent.com/LKhoe/LocalInfra/main/localinfra-health/icon.svg
 description: >-
@@ -15,7 +15,8 @@ description: >-
   The status page also maps which LocalInfra resources (Postgres, Redis, S3, the
   LLM gateway, the Cloudflare tunnel) each app uses, shows each container's
   memory and version, what the nightly backup holds and whether its last run
-  succeeded, says when a newer cloudflared is out, lists what each app
+  succeeded, shows the apps' anonymous usage metrics (Web Vitals, route views,
+  errors), says when a newer cloudflared is out, lists what each app
   integrates with (Google, Alexa, Spotify, YouTube Music...), and has
   step-by-step guides for publishing an app on Cloudflare, adding Google sign-in
   and connecting an Alexa skill with Echo Show screens.
@@ -26,10 +27,10 @@ description: >-
   app's package.json version and the backup's status files); it never changes
   anything.
 releaseNotes: >-
-  New Backups section: what the Postgres and Home Assistant backups hold and how the last run
-  went (needs the LocalInfra backup image from the same release). A banner says when a newer
-  cloudflared is out for the tunnel. Integrations show the services' real logos, and the
-  resource map no longer lists localinfra-backup as an app.
+  New Metrics section: each app's views, Web Vitals (LCP, INP, CLS, FCP, TTFB) and in-app
+  navigation time at the 75th percentile, its busiest routes and its errors, for the last 24 hours,
+  7 days or 30 days (needs the localinfra-metrics service from the same release). The resource map
+  shows which apps send metrics.
 developer: LKhoe
 website: https://github.com/LKhoe/LocalInfra
 repo: https://github.com/LKhoe/LocalInfra
