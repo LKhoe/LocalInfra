@@ -99,14 +99,21 @@ export function createService(config, store = openStore(config.databaseUrl)) {
   async function writeSummary(force = false) {
     // Every minute after new data, and every 15 minutes anyway (the 24h window slides)
     if (!force && !dirty && Date.now() - lastSummary < 15 * 60000) return;
-    const summary = await store.summary();
-    summary.retention = config.keep;
-    mkdirSync(dirname(config.summaryPath), { recursive: true });
-    const tmp = config.summaryPath + ".tmp";
-    writeFileSync(tmp, JSON.stringify(summary));
-    renameSync(tmp, config.summaryPath);
+    // Cleared before reading: a flush that lands while the summary is being computed sets it again,
+    // so that data goes out in the next run instead of waiting for the 15-minute one
     dirty = false;
-    lastSummary = Date.now();
+    try {
+      const summary = await store.summary();
+      summary.retention = config.keep;
+      mkdirSync(dirname(config.summaryPath), { recursive: true });
+      const tmp = config.summaryPath + ".tmp";
+      writeFileSync(tmp, JSON.stringify(summary));
+      renameSync(tmp, config.summaryPath);
+      lastSummary = Date.now();
+    } catch (err) {
+      dirty = true;
+      throw err;
+    }
   }
 
   async function prune() {
