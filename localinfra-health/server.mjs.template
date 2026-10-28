@@ -1,7 +1,8 @@
 // Container Health: umbrelOS widgets + a status page for the containers you run
 // yourself (LocalInfra, your projects), skipping the ones umbrelOS manages.
 //
-// Read-only by design: the only Docker API calls are GET /containers/json and, for
+// Read-only by design (the one thing it does besides reading is the speed test, which only makes
+// outbound requests when someone presses its button): the only Docker API calls are GET /containers/json and, for
 // the status page only, GET /containers/<id>/stats (one-shot memory reading) and, once
 // per container, GET /containers/<id>/json + /archive to read its app version.
 // The status page also shows each app's icon, fetched from its public address.
@@ -12,7 +13,9 @@
 // envsubst, so this file must NOT contain the dollar sign at all: no template
 // literals, no regex end anchors. scripts/check-health-app.sh enforces it.
 import http from "node:http";
+import { execFile } from "node:child_process";
 import os from "node:os";
+import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || "/var/run/docker.sock";
@@ -397,6 +400,166 @@ async function metricsSummary(snap) {
   return metricsCache.pending;
 }
 
+// ---------------------------------------------------------------- speed test
+// The Pi's connection to the internet, measured only when someone presses the button on the
+// status page (POST /speedtest): ping, download and upload against Cloudflare's public speed-test
+// endpoints. One run at a time, a pause between runs, a capped amount of data, nothing stored
+// (the last result lives in memory until the app restarts).
+const SPEED_HOST = "https://speed.cloudflare.com";
+const SPEED_SECONDS = Math.min(20, Math.max(3, Number(process.env.SPEEDTEST_SECONDS) || 8));
+// Most data one run moves in each direction
+const SPEED_MAX_BYTES = Math.min(1000, Math.max(20, Number(process.env.SPEEDTEST_MAX_MB) || 300)) * 1000000;
+const SPEED_STREAMS = 4;
+const SPEED_PINGS = 10;
+// Fixed address for the ICMP ping (never taken from a request or the environment)
+const SPEED_ICMP_ADDRESS = "1.1.1.1";
+const SPEED_ICMP_PINGS = 5;
+const SPEED_COOLDOWN_MS = 15 * 1000;
+const SPEED_PHASES = { ping: "ping", download: "download", upload: "upload" };
+
+// running, the phase in progress, the numbers measured so far (current) and how the last run ended
+const speed = { running: false, phase: null, current: {}, last: null, finishedAt: 0 };
+
+const median = (list) => [...list].sort((a, b) => a - b)[list.length >> 1];
+
+const pingStats = (times, via) => ({
+  ping: median(times),
+  jitter: times.slice(1).reduce((sum, t, i) => sum + Math.abs(t - times[i]), 0) / (times.length - 1),
+  via,
+});
+
+// Real ICMP echo with the image's own busybox ping. It needs no capability here: the kernel lets
+// the container's group open an ICMP datagram socket (net.ipv4.ping_group_range), so the app keeps
+// cap_drop ALL and no root. execFile, no shell, fixed arguments.
+function icmpPing() {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "ping",
+      ["-c", String(SPEED_ICMP_PINGS), "-W", "2", SPEED_ICMP_ADDRESS],
+      { timeout: 15000, maxBuffer: 64 * 1024 },
+      (error, stdout) => {
+        const times = [...String(stdout || "").matchAll(/time=([0-9.]+) ms/g)].map((m) => Number(m[1]));
+        if (times.length < 2) reject(new Error("ICMP ping got no replies" + (error && error.code ? " (" + error.code + ")" : "")));
+        else resolve(pingStats(times, "icmp"));
+      },
+    );
+  });
+}
+
+// Fallback: round trip of an empty HTTPS response, once the connection is open (the first
+// request, which resolves DNS and does the TLS handshake, is thrown away)
+async function httpsPing() {
+  const times = [];
+  for (let i = 0; i <= SPEED_PINGS; i++) {
+    const started = performance.now();
+    const res = await fetch(SPEED_HOST + "/__down?bytes=0", { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error("Cloudflare answered " + res.status);
+    await res.arrayBuffer();
+    if (i > 0) times.push(performance.now() - started);
+  }
+  return pingStats(times, "https");
+}
+
+const pingTest = () => icmpPing().catch(() => httpsPing());
+
+// Megabits per second: several parallel downloads for SPEED_SECONDS (or until SPEED_MAX_BYTES)
+async function downloadTest() {
+  const stop = new AbortController();
+  const each = Math.floor(SPEED_MAX_BYTES / SPEED_STREAMS);
+  let received = 0;
+  const started = performance.now();
+  const timer = setTimeout(() => stop.abort(), SPEED_SECONDS * 1000);
+  try {
+    await Promise.all(
+      Array.from({ length: SPEED_STREAMS }, async () => {
+        try {
+          const res = await fetch(SPEED_HOST + "/__down?bytes=" + each, { signal: stop.signal });
+          if (!res.ok) throw new Error("Cloudflare answered " + res.status);
+          for await (const chunk of res.body) received += chunk.length;
+        } catch (error) {
+          if (!stop.signal.aborted) throw error;
+        }
+      }),
+    );
+  } finally {
+    clearTimeout(timer);
+    stop.abort();
+  }
+  if (!received) throw new Error("no data received");
+  return (received * 8) / ((performance.now() - started) / 1000) / 1e6;
+}
+
+// Megabits per second: parallel POSTs that start small and grow while they finish in under a
+// second, counted only when they complete (a slow link doesn't wait for a huge request)
+async function uploadTest() {
+  const payload = randomBytes(8 * 1024 * 1024);
+  const stop = new AbortController();
+  let sent = 0;
+  const started = performance.now();
+  let last = started;
+  // Slow links finish the request in flight a few seconds after the deadline
+  const timer = setTimeout(() => stop.abort(), (SPEED_SECONDS + 5) * 1000);
+  try {
+    await Promise.all(
+      Array.from({ length: SPEED_STREAMS }, async () => {
+        let size = 256 * 1024;
+        try {
+          while (performance.now() - started < SPEED_SECONDS * 1000 && sent < SPEED_MAX_BYTES) {
+            const t = performance.now();
+            const res = await fetch(SPEED_HOST + "/__up", {
+              method: "POST",
+              headers: { "content-type": "application/octet-stream" },
+              body: payload.subarray(0, size),
+              signal: stop.signal,
+            });
+            if (!res.ok) throw new Error("Cloudflare answered " + res.status);
+            await res.arrayBuffer();
+            sent += size;
+            last = performance.now();
+            if (last - t < 1000 && size < payload.length) size *= 2;
+          }
+        } catch (error) {
+          if (!stop.signal.aborted) throw error;
+        }
+      }),
+    );
+  } finally {
+    clearTimeout(timer);
+    stop.abort();
+  }
+  if (!sent) throw new Error("nothing could be uploaded");
+  return (sent * 8) / ((last - started) / 1000) / 1e6;
+}
+
+async function runSpeedTest() {
+  speed.phase = SPEED_PHASES.ping;
+  Object.assign(speed.current, await pingTest());
+  speed.phase = SPEED_PHASES.download;
+  speed.current.download = await downloadTest();
+  speed.phase = SPEED_PHASES.upload;
+  speed.current.upload = await uploadTest();
+}
+
+// { status, ... } for POST /speedtest: starts a run unless one is going or the last one just ended
+function startSpeedTest() {
+  if (speed.running) return { status: 409, error: "A test is already running." };
+  const wait = speed.finishedAt + SPEED_COOLDOWN_MS - Date.now();
+  if (wait > 0) return { status: 429, error: "Wait " + Math.ceil(wait / 1000) + " s before running it again." };
+  speed.running = true;
+  speed.current = {};
+  runSpeedTest()
+    .then(
+      () => (speed.last = { at: Date.now(), ok: true, ...speed.current }),
+      (error) => (speed.last = { at: Date.now(), ok: false, error: String((error.cause && error.cause.code) || error.message || error), ...speed.current }),
+    )
+    .finally(() => {
+      speed.running = false;
+      speed.phase = null;
+      speed.finishedAt = Date.now();
+    });
+  return { status: 202 };
+}
+
 // ---------------------------------------------------------------- updates
 // LocalInfra pins these images to a version in its .env. While a status page is open, the
 // server looks up the newest release tag on Docker Hub (at most every UPDATE_TTL_MS) and the
@@ -736,6 +899,7 @@ const ICONS = {
   pulse: '<path d="M3 12h4l2.5-6 5 12 2.5-6h4"/>',
   metrics: '<path d="M4 20h16M7 16.5V11M12 16.5V6M17 16.5v-8"/>',
   up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  speed: '<path d="M4.5 17a8 8 0 1 1 15 0M12 14l3.5-4.5"/>',
 };
 
 // The real logos of the integrations, filled in their brand colours: [fill, d, extra attributes].
@@ -822,7 +986,7 @@ const mark = (name, cls) => (BRANDS[name] ? brand(name, cls) : icon(name, cls));
 const STYLE = [
   ":root { color-scheme: dark; --bg: #06060b; --text: #ececf4; --muted: rgba(236,236,244,.56); --faint: rgba(236,236,244,.3);",
   "  --line: rgba(255,255,255,.08); --ok: #4ade80; --warn: #fbbf24; --bad: #fb7185; --idle: #94a3b8;",
-  "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --llm: #c084fc; --metrics: #2dd4bf; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
+  "  --postgres: #60a5fa; --redis: #f472b6; --s3: #a3e635; --llm: #c084fc; --metrics: #2dd4bf; --speed: #38bdf8; --tunnel: #fb923c; --neon: #22d3ee; --neon2: #a78bfa;",
   "  --spotify: #1ed760; --youtube: #f87171; --apple: #cbd5e1; --lastfm: #f43f5e; --google: #4285f4; --alexa: #00caff; --homeassistant: #18bcf2;",
   "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
   "* { box-sizing: border-box; }",
@@ -1009,6 +1173,12 @@ const STYLE = [
   ".files li { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px/1.7 var(--mono); padding: 0 7px; border-radius: 7px;",
   "  border: 1px solid var(--line); background: rgba(255,255,255,.04); } .files li em { font-style: normal; color: var(--faint); margin-left: 6px; }",
   ".bk .foot { display: block; margin-top: 10px; color: var(--faint); font-size: 12px; overflow-wrap: anywhere; }",
+  // speed test
+  ".sp { padding: 14px 16px; }",
+  ".sp .vts { margin-top: 12px; } .sp .vt { padding: 10px 12px; } .sp .vt b { font-size: 22px; } .sp .vt small { white-space: normal; }",
+  ".sp-a { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 12px; color: var(--muted); font-size: 12.5px; }",
+  ".sp-a .btn { cursor: pointer; font: inherit; color: var(--text); } .sp-a .btn[disabled] { opacity: .55; cursor: progress; }",
+  ".sp-a .bad { color: var(--bad); }",
   // metrics
   ".mx-r { display: flex; gap: 6px; margin: -2px 0 10px; }",
   ".mx-r button { height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,.04); color: var(--muted); font: 12.5px system-ui, sans-serif; cursor: pointer; }",
@@ -1375,6 +1545,46 @@ function metricsSection(m) {
   );
 }
 
+// ---- speed test section (outside #live: it has its own polling while a test runs)
+const mbps = (n) => (n >= 100 ? n.toFixed(0) : n >= 10 ? n.toFixed(1) : n.toFixed(2)) + " Mbps";
+
+function speedTile(label, value, note) {
+  return (
+    '<div class="vt" style="--rc: var(--speed)"><span>' + label + "</span><b>" + (value == null ? "–" : value) + "</b><small>" + (note || "&nbsp;") + "</small></div>"
+  );
+}
+
+// What GET /speedtest sends and the page shows: the tiles, then the button's status line
+function speedBody() {
+  const src = speed.running ? speed.current : speed.last || {};
+  const num2 = (n) => (typeof n === "number" && Number.isFinite(n) ? n : null);
+  const ping = num2(src.ping), down = num2(src.download), up = num2(src.upload);
+  const tiles =
+    '<div class="vts">' +
+    speedTile("PING", ping == null ? null : ping.toFixed(ping >= 100 ? 0 : 1) + " ms", num2(src.jitter) == null ? "" : "jitter " + src.jitter.toFixed(1) + " ms" + (src.via ? " · " + (src.via === "icmp" ? "ICMP" : "HTTPS") : "")) +
+    speedTile("DOWNLOAD", down == null ? null : mbps(down), "") +
+    speedTile("UPLOAD", up == null ? null : mbps(up), "") +
+    "</div>";
+  let status;
+  if (speed.running) status = "Measuring " + escape(speed.phase || "ping") + "…";
+  else if (!speed.last) status = "No test since this app started.";
+  else if (speed.last.ok) status = "Measured " + when(speed.last.at) + ".";
+  else status = '<span class="bad">The last test failed (' + escape(speed.last.error) + ")</span>, " + when(speed.last.at) + ".";
+  return tiles + '<div class="sp-a"><button type="button" class="btn" id="sp-run" style="--c: var(--speed)"' + (speed.running ? " disabled" : "") + ">" +
+    icon("speed") + (speed.running ? "Testing…" : "Run speed test") + '</button><span id="sp-msg" role="status" aria-live="polite">' + status + "</span></div>";
+}
+
+function speedSection() {
+  return (
+    "<h2>Internet speed</h2>" +
+    '<section class="glass sp"><div class="bk-h"><span class="gi" style="--c: var(--speed)">' + icon("speed") + "</span><b>Raspberry Pi to the internet</b>" +
+    '<span class="n">on demand</span></div><div id="sp-body">' + speedBody() + "</div>" +
+    '<p class="intg-note" style="margin-left: 0">Runs only when you press the button (about ' + SPEED_SECONDS + " s each for download and upload, at most " +
+    Math.round(SPEED_MAX_BYTES / 1e6) + " MB per direction) against Cloudflare's speed-test servers. Ping is ICMP to 1.1.1.1 (the HTTPS round trip to Cloudflare if ICMP is blocked). " +
+    "Apps on the Pi share the line, so it may read lower while they are busy.</p></section>"
+  );
+}
+
 // One banner per pinned image with a newer release
 function updateBanners(updates) {
   return [...updates.values()]
@@ -1693,8 +1903,8 @@ const SCRIPT = [
   "      .catch(function () { beat.classList.add('off'); stamp.textContent = 'offline, retrying'; });",
   "  }",
   "  // Backup times: the server only knows how long ago, the browser adds its local date and time",
-  "  function stamps() {",
-  "    live.querySelectorAll('time[data-ts]').forEach(function (t) {",
+  "  function stamps(root) {",
+  "    (root || live).querySelectorAll('time[data-ts]').forEach(function (t) {",
   "      var d = new Date(Number(t.getAttribute('data-ts')));",
   "      t.textContent = d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) + ' (' + t.getAttribute('data-ago') + ')';",
   "    });",
@@ -1711,6 +1921,24 @@ const SCRIPT = [
   "    var b = e.target.closest('.mx-r [data-range]'); if (!b) return;",
   "    range = b.getAttribute('data-range'); save('lih.range', range); ranges();",
   "  });",
+  "  // Speed test: the button starts a run on the Pi, then the page polls its progress",
+  "  var sp = document.getElementById('sp-body'), spTimer = null;",
+  "  function spPaint(state) { sp.innerHTML = state.html; stamps(sp); if (state.running) spPoll(); }",
+  "  function spPoll() { clearTimeout(spTimer); spTimer = setTimeout(spGet, 1000); }",
+  "  function spGet() {",
+  "    fetch('speedtest', { cache: 'no-store' }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }).then(spPaint)",
+  "      .catch(function () { spPoll(); });",
+  "  }",
+  "  sp.addEventListener('click', function (e) {",
+  "    var b = e.target.closest('#sp-run'); if (!b || b.disabled) return;",
+  "    b.disabled = true;",
+  "    fetch('speedtest', { method: 'POST', headers: { 'x-speedtest': '1' } }).then(function (r) {",
+  "      if (r.status === 202 || r.status === 409) return spGet();",
+  "      return r.json().then(function (j) { spGet(); setTimeout(function () { var m = document.getElementById('sp-msg'); if (m) m.textContent = j.error || 'Could not start the test.'; }, 300); });",
+  "    }).catch(function () { spGet(); });",
+  "  });",
+  "  stamps(sp);",
+  "  spGet();",
   "  stamps();",
   "  ranges();",
   "  now();",
@@ -1810,9 +2038,10 @@ async function statusPage() {
       '<a class="btn" style="--c: var(--alexa)" href="https://developer.amazon.com/alexa/console/ask" target="_blank" rel="noopener noreferrer">' + brand("alexa") + "Alexa</a>" +
       "</nav></header>",
     '<div id="live">' + html + "</div>",
+    speedSection(),
     integrations(snap),
     guides(snap),
-    "<footer>Read-only: this page only lists containers and reads their memory, version, backup status and the apps' metrics summary.</footer>",
+    "<footer>Read-only: this page only lists containers and reads their memory, version, backup status and the apps' metrics summary. The speed test only sends traffic when you press its button.</footer>",
     "</main>",
     "<script>" + SCRIPT + "</script>",
     "</body>",
@@ -1830,21 +2059,33 @@ const routes = {
   "/favicon.svg": async () => ({ type: "image/svg+xml", body: FAVICON, cache: "public, max-age=86400" }),
   "/site-icon": async (url) => siteIconFor(url.searchParams.get("app")),
   "/live": async () => ({ type: "text/html; charset=utf-8", body: (await livePart()).html }),
+  "/speedtest": async () => ({ type: "application/json", body: JSON.stringify({ running: speed.running, phase: speed.phase, html: speedBody() }) }),
   "/": async () => ({ type: "text/html; charset=utf-8", body: await statusPage() }),
+};
+
+// POST routes start something, so they refuse anything a browser could send from another site:
+// the custom header forces a CORS preflight (never answered here) and Sec-Fetch-Site must be ours
+const posts = {
+  "/speedtest": async (url, req) => {
+    const site = req.headers["sec-fetch-site"];
+    if (req.headers["x-speedtest"] !== "1" || (site && site !== "same-origin")) return { status: 403, type: "application/json", body: '{"error":"Not allowed."}' };
+    const { status, error } = startSpeedTest();
+    return { status, type: "application/json", body: JSON.stringify(error ? { error } : { started: true }) };
+  },
 };
 
 http
   .createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
-    const route = req.method === "GET" ? routes[url.pathname] : undefined;
+    const route = req.method === "GET" ? routes[url.pathname] : req.method === "POST" ? posts[url.pathname] : undefined;
     if (!route) {
       res.writeHead(404, { "content-type": "text/plain" }).end("Not found");
       return;
     }
     try {
-      const { type, body, cache, headers } = await route(url);
+      const { type, body, cache, headers, status } = await route(url, req);
       res
-        .writeHead(200, { "content-type": type, "cache-control": cache || "no-store", "x-content-type-options": "nosniff", ...headers })
+        .writeHead(status || 200, { "content-type": type, "cache-control": cache || "no-store", "x-content-type-options": "nosniff", ...headers })
         .end(body);
     } catch (error) {
       res.writeHead(500, { "content-type": "text/plain" }).end(String(error?.message || error));

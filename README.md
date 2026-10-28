@@ -427,6 +427,14 @@ The status page refreshes every 15 seconds (only while it's visible) and shows:
   size, the Home Assistant `.tar`), when the last run was and whether it succeeded (with the step
   that failed), the last success, the schedule and how many sets are kept, plus what is not in
   the backup.
+- **Internet speed**: ping, download and upload of the Pi's own connection, measured only when
+  you press *Run speed test* (never on a schedule). The server runs it against Cloudflare's public
+  speed-test endpoints (`speed.cloudflare.com`): about 8 seconds each for download and upload,
+  4 parallel streams, at most 300 MB per direction (`SPEEDTEST_SECONDS`, `SPEEDTEST_MAX_MB` in the
+  app's compose to change). One run at a time and a 15 s pause between runs; the last result is
+  kept in memory until the app restarts. Ping is ICMP to `1.1.1.1` with the image's busybox `ping`, which
+  needs no extra privilege (the container keeps `cap_drop: ALL` and runs as `node`: the kernel's
+  `ping_group_range` allows it); if ICMP gets no replies it falls back to the HTTPS round trip. Apps on the Pi share the line, so it reads lower while they are busy.
 - **Integrations**: each service with its real logo (Google sign-in, Alexa skills with
   Echo Show screens, Spotify, YouTube Music, Apple, Last.fm, Web Push, SerpApi, data sources), with
   the env keys and OAuth redirect URIs. It's a list kept in `server.mjs.template` (`INTEGRATIONS`,
