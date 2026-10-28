@@ -125,6 +125,63 @@ describe("aggregator", () => {
 });
 
 const DB = process.env.METRICS_TEST_DATABASE_URL;
+describe("summary scheduling (no Postgres)", () => {
+  // store.summary() is slow here; a flush lands while it runs (the real race: the summary read the
+  // daily rows before the flush and the hourly rows after, or missed the flush altogether)
+  function fakeService() {
+    const dir = mkdtempSync(join(tmpdir(), "metrics-sched-"));
+    const summaries = [];
+    let release;
+    const store = {
+      findApp: async () => "app_one",
+      today: async () => ({ apps: new Map() }),
+      flush: async () => {},
+      summary: async () => {
+        summaries.push(Date.now());
+        if (summaries.length === 1) await new Promise((resolve) => (release = resolve));
+        return { generated_at: new Date().toISOString(), apps: {} };
+      },
+    };
+    const config = configFromEnv({ METRICS_SUMMARY_PATH: join(dir, "summary.json") });
+    return { service: createService(config, store), summaries, release: () => release(), dir };
+  }
+
+  test("a flush during the summary is picked up by the next run, not 15 minutes later", async () => {
+    const { service, summaries, release, dir } = fakeService();
+    try {
+      const first = service.writeSummary(true); // starts computing, blocked inside store.summary()
+      await new Promise((resolve) => setImmediate(resolve));
+      service.aggregator.add("app_one", "desktop", [{ t: "view", route: "/" }]);
+      await service.flush(); // lands while the summary is being computed
+      release();
+      await first;
+      await service.writeSummary(); // the regular tick, not forced
+      assert.equal(summaries.length, 2, "the data flushed mid-summary must trigger another summary");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed summary is retried on the next tick", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "metrics-sched-"));
+    let calls = 0;
+    const store = {
+      summary: async () => {
+        if (++calls === 1) throw new Error("db down");
+        return { generated_at: new Date().toISOString(), apps: {} };
+      },
+    };
+    const service = createService(configFromEnv({ METRICS_SUMMARY_PATH: join(dir, "summary.json") }), store);
+    try {
+      await service.writeSummary(true).catch(() => {});
+      await service.writeSummary();
+      assert.equal(calls, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("service (Postgres)", { skip: !DB && "METRICS_TEST_DATABASE_URL is not set" }, () => {
   const schema = "metrics_test_" + process.pid;
   let admin, dir, service, store, base, key, otherKey;
