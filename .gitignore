@@ -4,3 +4,7 @@ backups-local/
 s3-local/
 ha-backups-local/
 node_modules/
+
+# every env variant (backups, .env.dev, ...); only the example is tracked
+.env*
+!.env.example
