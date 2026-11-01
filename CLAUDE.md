@@ -18,7 +18,7 @@ DOCKER_CONTEXT=umbrel docker compose ps
 DOCKER_CONTEXT=umbrel docker compose logs -f <service>
 
 # Docker Desktop on the Mac (local dev for the apps)
-BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local DOCKER_CONTEXT=desktop-linux docker compose up -d --build
+EXTERNAL_ROOT=$PWD BACKUP_DIR=$PWD/backups-local S3_DATA_DIR=$PWD/s3-local DOCKER_CONTEXT=desktop-linux docker compose up -d --build
 
 scripts/provision-app.sh <app_name> <path/to/app> [--no-redis] [--s3] [--llm]  # new app + writes its .env
 scripts/new-project.sh <name>        # provision only, prints the env
@@ -32,6 +32,7 @@ scripts/check-health-app.sh          # before releasing the Container Health app
   active (usually `umbrel`, i.e. the Pi).
 - **No `./file` bind mounts** in `compose.yml`: it is deployed from the Mac, so relative paths would
   point at the Mac. Use volumes or absolute Pi paths (`BACKUP_DIR`, `S3_DATA_DIR`).
+- **The drive is mounted into containers via its parent (`EXTERNAL_ROOT`, `rslave`), never by the drive's own path**: Docker would create a root-owned folder there if it starts before umbrelOS mounts the drive, and umbrel then mounts the drive as `SSD_RAID1 (2)`. `s3/start.sh` waits for its marker file; `backup/entrypoint.sh` links `/backups`.
 - **Marker files guard the external drive** (`.localinfra-backup-target`, `.localinfra-s3-target`).
   Containers refuse to start/run without them so the SD card never fills. Don't bypass them.
 - **Isolation per project**: own Postgres role+DB, Redis ACL user limited to `<project>:*`, S3 bucket
