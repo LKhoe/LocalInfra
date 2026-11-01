@@ -91,6 +91,15 @@ docker context create umbrel --docker "host=ssh://umbrel-docker"
 Already have the context from before? `docker context update umbrel --docker "host=ssh://umbrel-docker"`.
 `deploy.sh` warns when the context's SSH host shares connections.
 
+**`permission denied` on `/var/run/docker.sock`?** Newer umbrelOS images rebuild the root
+filesystem at every boot, so `usermod -aG docker umbrel` doesn't survive a reboot. Install the
+boot hook once (it runs as root before umbreld and re-adds the group; keep it root-owned):
+
+```bash
+scp scripts/umbrel-pre-start-hook.sh umbrel-docker:/tmp/pre-start
+ssh -t umbrel-docker 'sudo install -D -o root -g root -m 755 /tmp/pre-start /home/umbrel/umbrel/custom-hooks/pre-start && rm /tmp/pre-start'
+```
+
 ### External drive for backups
 
 Find the drive's mount point on the Pi (umbrelOS mounts drives under
