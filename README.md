@@ -113,12 +113,20 @@ ssh umbrel@umbrel.local 'mkdir -p "<mountpoint>/localinfra-backups" && touch "<m
 ### External drive for S3
 
 Garage keeps its metadata and objects in `S3_DATA_DIR` on the same RAID 1 drive, guarded by
-the same kind of marker file: without `.localinfra-s3-target` the container refuses to start
-instead of filling the SD card. `scripts/bootstrap-pi.sh` creates it; by hand:
+the same kind of marker file: without `.localinfra-s3-target` the container waits instead of
+filling the SD card. `scripts/bootstrap-pi.sh` creates it; by hand:
 
 ```bash
 ssh umbrel@umbrel.local 'mkdir -p "<mountpoint>/localinfra-s3" && touch "<mountpoint>/localinfra-s3/.localinfra-s3-target"'
 ```
+
+**Boot order.** Docker starts the containers before umbrelOS mounts the drive. If compose bound
+the drive's own path, Docker would create an empty root-owned folder there and umbrel would
+then mount the drive as `SSD_RAID1 (2)`. So `s3` and `backup` bind the parent folder
+(`EXTERNAL_ROOT`, default `/home/umbrel/umbrel/external`) with `rslave` propagation, and
+`BACKUP_DIR` / `S3_DATA_DIR` only point inside it. The drive appears in the containers once
+it is mounted: `s3` waits for its marker (logging once a minute), `backup` links `/backups`
+and its nightly run refuses to write until the marker is there.
 
 The drive is **exFAT**, so Garage uses its SQLite metadata engine (LMDB, the default, needs
 sparse files). The objects are not backed up separately: they're on the RAID 1 drive, which
@@ -503,7 +511,7 @@ Run the same stack on Docker Desktop. The shell variables override the paths fro
 mkdir -p backups-local && touch backups-local/.localinfra-backup-target    # git-ignored
 mkdir -p s3-local && touch s3-local/.localinfra-s3-target                  # git-ignored
 mkdir -p ha-backups-local                                                   # git-ignored
-BACKUP_DIR=./backups-local S3_DATA_DIR=./s3-local HA_BACKUP_SOURCE=./ha-backups-local \
+EXTERNAL_ROOT=$PWD BACKUP_DIR=$PWD/backups-local S3_DATA_DIR=$PWD/s3-local HA_BACKUP_SOURCE=./ha-backups-local \
   DOCKER_CONTEXT=desktop-linux docker compose up -d --build
 DOCKER_CONTEXT=desktop-linux scripts/new-project.sh yarg
 ```

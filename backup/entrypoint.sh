@@ -5,6 +5,11 @@ set -eu
 
 BACKUP_CRON="${BACKUP_CRON:-0 4 * * *}"
 
+# The external drive may be mounted after this container starts (compose mounts the parent
+# folder with rslave propagation). Every script and the healthcheck use /backups, so link it
+# to the real folder; backup.sh refuses to write until the marker file is there.
+ln -sfn "${BACKUP_DIR:?BACKUP_DIR must be set}" /backups
+
 # busybox crond starts jobs with an almost empty environment, so the connection
 # settings (PGHOST, PGPASSWORD, ...) are handed over through a root-only file.
 umask 077
